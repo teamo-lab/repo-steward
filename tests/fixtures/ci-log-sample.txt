@@ -1,0 +1,29 @@
+Run npm run build
+> repo-steward@0.1.0 build
+> tsc
+
+src/services/task-discovery.ts(42,5): error TS2322: Type 'string' is not assignable to type 'number'.
+
+  42     confidence: "high",
+         ~~~~~~~~~~
+
+  src/types/index.ts(62,3)
+    The expected type comes from property 'confidence' which is declared here on type 'Task'
+
+src/services/task-discovery.ts(67,10): error TS2345: Argument of type 'undefined' is not assignable to parameter of type 'string'.
+
+  67     await saveSignal(repoId, undefined, 'github', payload, extracted);
+                                  ~~~~~~~~~
+
+src/api/routes.ts(15,3): error TS7006: Parameter 'req' implicitly has an 'any' type.
+
+  15   app.get('/health', async (req, reply) => {
+        ~~~
+
+Found 3 errors in 2 files.
+
+Errors  Files
+     2  src/services/task-discovery.ts:42
+     1  src/api/routes.ts:15
+
+error Command failed with exit code 2.

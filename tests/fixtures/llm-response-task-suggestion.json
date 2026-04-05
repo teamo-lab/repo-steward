@@ -1,0 +1,7 @@
+{
+  "confidence": 0.87,
+  "riskLevel": "low",
+  "reasoning": "This is a straightforward type error fix — the root cause is a string literal being passed where a number is expected. The fix is isolated to two files with clear type annotations.",
+  "refinedTitle": "Fix TypeScript type errors in task-discovery service",
+  "refinedDescription": "Two type errors in task-discovery.ts: (1) confidence field assigned a string instead of number, (2) undefined passed to saveSignal where string is required. Plus one implicit-any in routes.ts. All are compile-time errors with obvious fixes."
+}

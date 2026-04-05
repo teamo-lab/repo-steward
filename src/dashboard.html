@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Repo Steward — Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --text-muted: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --red: #f85149; --yellow: #d29922; --purple: #bc8cff;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.5; }
+  .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+
+  /* Header */
+  header { display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 0; border-bottom: 1px solid var(--border); margin-bottom: 24px; }
+  header h1 { font-size: 24px; font-weight: 600; }
+  header h1 span { color: var(--accent); }
+  .status-badge { display: flex; align-items: center; gap: 8px; font-size: 14px;
+    padding: 6px 14px; border-radius: 20px; background: var(--surface); border: 1px solid var(--border); }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; }
+  .status-dot.ok { background: var(--green); }
+  .status-dot.fail { background: var(--red); }
+
+  /* Stats grid */
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 16px; margin-bottom: 32px; }
+  .stat-card { background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 20px; }
+  .stat-card .label { font-size: 12px; color: var(--text-muted); text-transform: uppercase;
+    letter-spacing: 0.5px; margin-bottom: 4px; }
+  .stat-card .value { font-size: 32px; font-weight: 700; }
+  .stat-card .value.green { color: var(--green); }
+  .stat-card .value.yellow { color: var(--yellow); }
+  .stat-card .value.red { color: var(--red); }
+
+  /* Section */
+  .section { margin-bottom: 32px; }
+  .section-header { display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 16px; }
+  .section-header h2 { font-size: 18px; font-weight: 600; }
+  .section-header .count { font-size: 13px; color: var(--text-muted);
+    background: var(--surface); padding: 2px 10px; border-radius: 12px; border: 1px solid var(--border); }
+
+  /* Task card */
+  .task-card { background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 20px; margin-bottom: 12px;
+    transition: border-color 0.15s; }
+  .task-card:hover { border-color: var(--accent); }
+  .task-header { display: flex; align-items: flex-start; justify-content: space-between;
+    margin-bottom: 12px; }
+  .task-title { font-size: 16px; font-weight: 600; flex: 1; }
+  .badge { display: inline-block; font-size: 11px; font-weight: 600; padding: 3px 10px;
+    border-radius: 12px; text-transform: uppercase; letter-spacing: 0.3px; }
+  .badge.ci_fix { background: rgba(248,81,73,0.15); color: var(--red); }
+  .badge.deploy_fix { background: rgba(210,153,34,0.15); color: var(--yellow); }
+  .badge.todo_cleanup { background: rgba(188,140,255,0.15); color: var(--purple); }
+  .badge.test_gap { background: rgba(63,185,80,0.15); color: var(--green); }
+  .badge.code_quality, .badge.dead_code { background: rgba(188,140,255,0.15); color: var(--purple); }
+  .badge.security_fix { background: rgba(248,81,73,0.15); color: var(--red); }
+  .badge.perf_improvement { background: rgba(210,153,34,0.15); color: var(--yellow); }
+  .badge.error_handling, .badge.type_safety { background: rgba(88,166,255,0.15); color: var(--accent); }
+  .badge.config_drift, .badge.doc_gap { background: rgba(139,148,158,0.15); color: var(--text-muted); }
+  .badge.dependency_upgrade { background: rgba(210,153,34,0.15); color: var(--yellow); }
+  .badge.low { background: rgba(63,185,80,0.15); color: var(--green); }
+  .badge.medium { background: rgba(210,153,34,0.15); color: var(--yellow); }
+  .badge.high { background: rgba(248,81,73,0.15); color: var(--red); }
+  .badge.suggested { background: rgba(88,166,255,0.15); color: var(--accent); }
+  .badge.approved, .badge.executing { background: rgba(210,153,34,0.15); color: var(--yellow); }
+  .badge.pr_created, .badge.verified, .badge.merged { background: rgba(63,185,80,0.15); color: var(--green); }
+  .badge.dismissed, .badge.failed { background: rgba(248,81,73,0.15); color: var(--red); }
+  .badge.snoozed { background: rgba(139,148,158,0.15); color: var(--text-muted); }
+
+  .task-meta { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  .task-meta .tag { font-size: 12px; color: var(--text-muted); }
+  .task-meta .tag strong { color: var(--text); }
+  .task-desc { font-size: 14px; color: var(--text-muted); margin-bottom: 16px; }
+
+  .evidence-box { background: var(--bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+  .evidence-box .label { font-size: 11px; color: var(--text-muted); text-transform: uppercase;
+    margin-bottom: 6px; }
+  .evidence-box pre { font-size: 12px; color: var(--text); white-space: pre-wrap;
+    word-break: break-all; font-family: 'SF Mono', 'Fira Code', monospace; }
+
+  .actions { display: flex; gap: 8px; }
+  .btn { padding: 8px 18px; border-radius: 8px; font-size: 13px; font-weight: 600;
+    border: 1px solid var(--border); cursor: pointer; transition: all 0.15s; }
+  .btn-approve { background: var(--green); color: #fff; border-color: var(--green); }
+  .btn-approve:hover { opacity: 0.85; }
+  .btn-dismiss { background: transparent; color: var(--red); border-color: var(--red); }
+  .btn-dismiss:hover { background: rgba(248,81,73,0.1); }
+  .btn-snooze { background: transparent; color: var(--text-muted); }
+  .btn-snooze:hover { background: rgba(139,148,158,0.1); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* Execution logs */
+  .log-entry { font-size: 12px; font-family: monospace; padding: 4px 0;
+    border-bottom: 1px solid rgba(48,54,61,0.5); }
+  .log-entry .ts { color: var(--text-muted); margin-right: 8px; }
+  .log-entry.info { color: var(--accent); }
+  .log-entry.warn { color: var(--yellow); }
+  .log-entry.error { color: var(--red); }
+
+  /* Repo selector */
+  .repo-selector { display: flex; gap: 8px; align-items: center; }
+  .repo-selector select { background: var(--surface); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; font-size: 14px; }
+
+  /* Empty state */
+  .empty { text-align: center; padding: 48px 24px; color: var(--text-muted); }
+  .empty .icon { font-size: 48px; margin-bottom: 12px; opacity: 0.4; }
+
+  /* Toast */
+  .toast { position: fixed; bottom: 24px; right: 24px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 10px; padding: 12px 20px;
+    font-size: 14px; box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    transform: translateY(100px); opacity: 0; transition: all 0.3s; z-index: 100; }
+  .toast.show { transform: translateY(0); opacity: 1; }
+
+  /* Confidence bar */
+  .conf-bar { width: 80px; height: 6px; background: var(--border); border-radius: 3px;
+    display: inline-block; vertical-align: middle; margin-left: 6px; }
+  .conf-fill { height: 100%; border-radius: 3px; }
+
+  /* Responsive */
+  @media (max-width: 768px) {
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .task-header { flex-direction: column; gap: 8px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <header>
+    <h1><span>&#9670;</span> Repo Steward</h1>
+    <div id="health-badge" class="status-badge">
+      <div class="status-dot" id="health-dot"></div>
+      <span id="health-text">Checking...</span>
+    </div>
+  </header>
+
+  <!-- Repo selector -->
+  <div class="repo-selector" style="margin-bottom: 24px;">
+    <label style="font-size: 14px; color: var(--text-muted);">Repository:</label>
+    <select id="repo-select" onchange="loadRepo()">
+      <option value="">Loading...</option>
+    </select>
+    <input id="add-repo-input" type="text" placeholder="owner/repo"
+      style="margin-left: auto; background: var(--surface); color: var(--text); border: 1px solid var(--border);
+        border-radius: 8px; padding: 8px 12px; font-size: 14px; width: 220px;"
+      onkeydown="if(event.key==='Enter') addRepo()">
+    <button class="btn btn-approve" onclick="addRepo()" style="font-size: 12px;">
+      + Add Repo
+    </button>
+    <button class="btn" onclick="seedDemo()" style="font-size: 12px;">
+      Seed Demo Data
+    </button>
+    <button class="btn btn-approve" onclick="runDiscovery()" style="font-size: 12px;">
+      Run Discovery
+    </button>
+  </div>
+
+  <!-- Stats -->
+  <div class="stats" id="stats-grid">
+    <div class="stat-card"><div class="label">Suggested</div><div class="value" id="stat-suggested">—</div></div>
+    <div class="stat-card"><div class="label">Accepted</div><div class="value green" id="stat-accepted">—</div></div>
+    <div class="stat-card"><div class="label">Acceptance Rate</div><div class="value yellow" id="stat-rate">—</div></div>
+    <div class="stat-card"><div class="label">Merged</div><div class="value" id="stat-merged">—</div></div>
+    <div class="stat-card"><div class="label">DB</div><div class="value green" id="stat-db">—</div></div>
+    <div class="stat-card"><div class="label">Redis</div><div class="value green" id="stat-redis">—</div></div>
+  </div>
+
+  <!-- Suggestions -->
+  <div class="section">
+    <div class="section-header">
+      <h2>Suggestions</h2>
+      <span class="count" id="suggestion-count">0</span>
+    </div>
+    <div id="suggestions-list"></div>
+  </div>
+
+  <!-- All Tasks -->
+  <div class="section">
+    <div class="section-header">
+      <h2>All Tasks</h2>
+      <span class="count" id="task-count">0</span>
+    </div>
+    <div id="tasks-list"></div>
+  </div>
+
+  <!-- Executions -->
+  <div class="section">
+    <div class="section-header">
+      <h2>Executions</h2>
+      <span class="count" id="exec-count">0</span>
+    </div>
+    <div id="executions-list"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const API = window.location.origin;
+let currentRepo = null;
+
+function toast(msg, ms = 3000) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), ms);
+}
+
+function confColor(c) {
+  if (c >= 0.75) return 'var(--green)';
+  if (c >= 0.5) return 'var(--yellow)';
+  return 'var(--red)';
+}
+
+async function api(path, opts) {
+  const res = await fetch(API + path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+  });
+  return res.json();
+}
+
+// ── Health ──
+async function checkHealth() {
+  try {
+    const h = await api('/health');
+    document.getElementById('health-dot').className = 'status-dot ' + (h.status === 'healthy' ? 'ok' : 'fail');
+    document.getElementById('health-text').textContent = h.status === 'healthy' ? 'All systems operational' : 'Degraded';
+    document.getElementById('stat-db').textContent = h.checks.database === 'ok' ? 'OK' : 'FAIL';
+    document.getElementById('stat-db').className = 'value ' + (h.checks.database === 'ok' ? 'green' : 'red');
+    document.getElementById('stat-redis').textContent = h.checks.redis === 'ok' ? 'OK' : 'FAIL';
+    document.getElementById('stat-redis').className = 'value ' + (h.checks.redis === 'ok' ? 'green' : 'red');
+  } catch {
+    document.getElementById('health-dot').className = 'status-dot fail';
+    document.getElementById('health-text').textContent = 'Offline';
+  }
+}
+
+// ── Repos ──
+async function loadRepos() {
+  const data = await api('/api/v1/repos');
+  const sel = document.getElementById('repo-select');
+  sel.innerHTML = '';
+  if (data.repos.length === 0) {
+    sel.innerHTML = '<option value="">No repos — click "Seed Demo Data"</option>';
+    return;
+  }
+  data.repos.forEach(r => {
+    const o = document.createElement('option');
+    o.value = r.id;
+    o.textContent = r.full_name + ' (' + (r.language || '?') + ')';
+    sel.appendChild(o);
+  });
+  currentRepo = data.repos[0].id;
+  loadRepo();
+}
+
+async function loadRepo() {
+  currentRepo = document.getElementById('repo-select').value;
+  if (!currentRepo) return;
+  await Promise.all([loadStats(), loadSuggestions(), loadTasks(), loadExecutions()]);
+}
+
+// ── Stats ──
+async function loadStats() {
+  if (!currentRepo) return;
+  const data = await api('/api/v1/repos/' + currentRepo + '/stats');
+  document.getElementById('stat-suggested').textContent = data.metrics.totalSuggested;
+  document.getElementById('stat-accepted').textContent = data.metrics.totalAccepted;
+  document.getElementById('stat-rate').textContent = data.metrics.acceptanceRate + '%';
+  document.getElementById('stat-merged').textContent = data.metrics.totalMerged;
+}
+
+// ── Suggestions ──
+async function loadSuggestions() {
+  if (!currentRepo) return;
+  const data = await api('/api/v1/repos/' + currentRepo + '/suggestions');
+  const el = document.getElementById('suggestions-list');
+  document.getElementById('suggestion-count').textContent = data.suggestions.length;
+
+  if (data.suggestions.length === 0) {
+    el.innerHTML = '<div class="empty"><div class="icon">&#10003;</div>No pending suggestions</div>';
+    return;
+  }
+
+  el.innerHTML = data.suggestions.map(s => renderTask(s.task, true)).join('');
+}
+
+// ── Tasks ──
+async function loadTasks() {
+  if (!currentRepo) return;
+  const data = await api('/api/v1/repos/' + currentRepo + '/tasks');
+  const el = document.getElementById('tasks-list');
+  document.getElementById('task-count').textContent = data.count;
+
+  if (!data.tasks || data.tasks.length === 0) {
+    el.innerHTML = '<div class="empty"><div class="icon">&#128269;</div>No tasks yet — send a webhook or run discovery</div>';
+    return;
+  }
+
+  el.innerHTML = data.tasks.map(t => renderTask(t, false)).join('');
+}
+
+function renderTask(task, showActions) {
+  const evidence = typeof task.evidence === 'string' ? JSON.parse(task.evidence) : task.evidence;
+  const verification = typeof task.verification === 'string' ? JSON.parse(task.verification) : task.verification;
+  const conf = task.confidence;
+  const risk = task.risk_level || task.riskLevel || 'low';
+  const status = task.status;
+
+  return `
+    <div class="task-card">
+      <div class="task-header">
+        <div class="task-title">${esc(task.title)}</div>
+        <div style="display:flex; gap:6px; flex-shrink:0;">
+          <span class="badge ${task.type}">${task.type.replace('_', ' ')}</span>
+          <span class="badge ${risk}">${risk} risk</span>
+          <span class="badge ${status}">${status}</span>
+        </div>
+      </div>
+      <div class="task-desc">${esc(task.description)}</div>
+      <div class="task-meta">
+        <span class="tag"><strong>Confidence:</strong> ${Math.round(conf * 100)}%
+          <span class="conf-bar"><span class="conf-fill" style="width:${conf*100}%; background:${confColor(conf)}"></span></span>
+        </span>
+        <span class="tag"><strong>Est. files:</strong> ${(task.impact?.estimatedFiles || task.impact?.estimated_files || []).length}</span>
+        <span class="tag"><strong>Est. lines:</strong> ~${task.impact?.estimatedLinesChanged || task.impact?.estimated_lines_changed || '?'}</span>
+      </div>
+      ${evidence?.signals?.length ? `
+        <div class="evidence-box">
+          <div class="label">Evidence</div>
+          <pre>${evidence.signals.map(s => '• ' + esc(s)).join('\n')}</pre>
+        </div>
+      ` : ''}
+      ${evidence?.logSnippets?.length ? `
+        <div class="evidence-box">
+          <div class="label">Log Snippet</div>
+          <pre>${evidence.logSnippets.map(s => esc(s)).join('\n---\n')}</pre>
+        </div>
+      ` : ''}
+      ${verification?.steps?.length ? `
+        <div class="evidence-box">
+          <div class="label">Verification Plan</div>
+          <pre>${verification.steps.map((s,i) => (i+1) + '. ' + esc(s)).join('\n')}</pre>
+        </div>
+      ` : ''}
+      ${showActions && status === 'suggested' ? `
+        <div class="actions">
+          <button class="btn btn-approve" onclick="taskAction('${task.id}', 'approve')">Approve</button>
+          <button class="btn btn-dismiss" onclick="taskAction('${task.id}', 'dismiss')">Dismiss</button>
+          <button class="btn btn-snooze" onclick="taskAction('${task.id}', 'snooze')">Snooze 24h</button>
+        </div>
+      ` : ''}
+      ${task.execution_id ? `<div style="font-size:12px; color:var(--text-muted); margin-top:8px;">Execution: ${task.execution_id}</div>` : ''}
+    </div>
+  `;
+}
+
+// ── Executions ──
+async function loadExecutions() {
+  const data = await api('/api/v1/executions');
+  const el = document.getElementById('executions-list');
+  document.getElementById('exec-count').textContent = data.executions.length;
+
+  if (data.executions.length === 0) {
+    el.innerHTML = '<div class="empty"><div class="icon">&#9881;</div>No executions yet</div>';
+    return;
+  }
+
+  el.innerHTML = data.executions.map(ex => `
+    <div class="task-card">
+      <div class="task-header">
+        <div class="task-title" style="font-size:14px;">
+          <span style="color:var(--accent);">Branch:</span> ${esc(ex.branch_name)}
+        </div>
+        <div style="display:flex; gap:6px;">
+          <span class="badge ${ex.status}">${ex.status}</span>
+          <span class="badge">${ex.agent_provider}</span>
+        </div>
+      </div>
+      ${ex.pr_url ? `<div style="margin-bottom:8px;"><a href="${ex.pr_url}" style="color:var(--accent);">${ex.pr_url}</a></div>` : ''}
+      ${(ex.logs || []).length ? `
+        <div class="evidence-box">
+          <div class="label">Execution Logs</div>
+          ${ex.logs.map(l => `
+            <div class="log-entry ${l.level}">
+              <span class="ts">${new Date(l.timestamp).toLocaleTimeString()}</span>
+              ${esc(l.message)}
+            </div>
+          `).join('')}
+        </div>
+      ` : ''}
+      <div style="font-size:12px; color:var(--text-muted);">
+        Task: ${ex.task_id}
+        ${ex.started_at ? ' | Started: ' + new Date(ex.started_at).toLocaleString() : ''}
+      </div>
+    </div>
+  `).join('');
+}
+
+// ── Actions ──
+async function taskAction(taskId, action) {
+  const body = { action };
+  if (action === 'dismiss') body.reason = 'Dismissed from dashboard';
+  if (action === 'snooze') body.snoozeUntil = new Date(Date.now() + 86400000).toISOString();
+
+  await api('/api/v1/tasks/' + taskId + '/action', {
+    method: 'POST', body: JSON.stringify(body),
+  });
+  toast(action === 'approve' ? 'Task approved — execution queued' :
+        action === 'dismiss' ? 'Task dismissed' : 'Task snoozed for 24h');
+  setTimeout(() => loadRepo(), 500);
+}
+
+async function addRepo() {
+  const input = document.getElementById('add-repo-input');
+  const fullName = input.value.trim();
+  if (!fullName || !fullName.includes('/')) {
+    toast('Enter owner/repo format, e.g. teamo-lab/myapp');
+    return;
+  }
+  toast('Adding ' + fullName + '...');
+  try {
+    const data = await api('/api/v1/repos', {
+      method: 'POST', body: JSON.stringify({ full_name: fullName }),
+    });
+    input.value = '';
+    const repoId = data.repo.id;
+    await loadRepos();
+    // Select the new repo
+    document.getElementById('repo-select').value = repoId;
+    currentRepo = repoId;
+    toast(data.created ? 'Repo added! Running discovery...' : 'Repo already exists. Running discovery...');
+    const disc = await api('/api/v1/repos/' + repoId + '/discover', { method: 'POST' });
+    toast('Discovery complete: ' + disc.count + ' task(s) found');
+    await loadRepo();
+  } catch (e) {
+    toast('Failed to add repo: ' + e.message);
+  }
+}
+
+async function runDiscovery() {
+  if (!currentRepo) return toast('Select a repo first');
+  toast('Running discovery...');
+  const data = await api('/api/v1/repos/' + currentRepo + '/discover', { method: 'POST' });
+  toast('Discovery complete: ' + data.count + ' task(s) found');
+  setTimeout(() => loadRepo(), 500);
+}
+
+async function seedDemo() {
+  toast('Seeding demo data...');
+  // Create repo via webhook-ready approach: insert directly then send webhooks
+  // First check if demo repo exists
+  const repos = await api('/api/v1/repos');
+  let repoId = repos.repos.find(r => r.full_name === 'demo-org/demo-app')?.id;
+
+  if (!repoId) {
+    // We need to create via DB — use a POST to a seed endpoint
+    // Since there's no seed endpoint, we'll send webhooks that auto-create signals
+    toast('No demo repo found. Creating via API is not yet supported — use psql to insert a repo, then reload.');
+    return;
+  }
+
+  // Send CI failure webhook
+  await api('/api/v1/webhooks/github', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-github-event': 'check_run' },
+    body: JSON.stringify({
+      action: 'completed',
+      check_run: { id: Date.now(), name: 'build-and-test', conclusion: 'failure',
+        output: { title: 'Build failed', summary: '5 TypeScript errors found',
+          text: 'src/api/handler.ts(22,5): error TS2322: Type mismatch\nsrc/lib/utils.ts(8,1): error TS7006: Implicit any' },
+        html_url: 'https://github.com/demo-org/demo-app/actions/runs/' + Date.now()
+      },
+      repository: { id: 888, full_name: 'demo-org/demo-app' },
+      installation: { id: 222 }
+    }),
+  });
+
+  // Send deploy failure webhook
+  await api('/api/v1/webhooks/github', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-github-event': 'deployment_status' },
+    body: JSON.stringify({
+      action: 'created',
+      deployment_status: { state: 'failure',
+        description: 'Container health check timeout after 120s',
+        log_url: 'https://vercel.com/demo-org/demo-app/dpl_' + Date.now().toString(36)
+      },
+      deployment: { ref: 'main', environment: 'production' },
+      repository: { id: 888, full_name: 'demo-org/demo-app' },
+      installation: { id: 222 }
+    }),
+  });
+
+  toast('Demo signals created. Running discovery...');
+  await api('/api/v1/repos/' + repoId + '/discover', { method: 'POST' });
+  toast('Demo data ready!');
+  setTimeout(() => loadRepo(), 500);
+}
+
+function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+// ── Init ──
+checkHealth();
+loadRepos();
+setInterval(checkHealth, 15000);
+</script>
+
+</body>
+</html>

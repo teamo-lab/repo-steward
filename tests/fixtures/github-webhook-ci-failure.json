@@ -1,0 +1,39 @@
+{
+  "action": "completed",
+  "check_run": {
+    "id": 28029440772,
+    "name": "build",
+    "head_sha": "abc123def456",
+    "status": "completed",
+    "conclusion": "failure",
+    "started_at": "2026-04-05T05:50:00Z",
+    "completed_at": "2026-04-05T05:55:00Z",
+    "output": {
+      "title": "Build failed",
+      "summary": "TypeScript compilation failed with 3 errors in 2 files",
+      "text": "src/services/task-discovery.ts(42,5): error TS2322: Type 'string' is not assignable to type 'number'.\nsrc/services/task-discovery.ts(67,10): error TS2345: Argument of type 'undefined' is not assignable to parameter of type 'string'.\nsrc/api/routes.ts(15,3): error TS7006: Parameter 'req' implicitly has an 'any' type.",
+      "annotations_count": 3,
+      "annotations_url": "https://api.github.com/repos/acme/webapp/check-runs/28029440772/annotations"
+    },
+    "html_url": "https://github.com/acme/webapp/actions/runs/12345/job/67890",
+    "app": {
+      "id": 15368,
+      "slug": "github-actions",
+      "name": "GitHub Actions"
+    },
+    "check_suite": {
+      "id": 30406985513,
+      "head_branch": "main"
+    }
+  },
+  "repository": {
+    "id": 123456789,
+    "name": "webapp",
+    "full_name": "acme/webapp",
+    "private": true,
+    "default_branch": "main"
+  },
+  "installation": {
+    "id": 98765432
+  }
+}
