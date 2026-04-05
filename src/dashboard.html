@@ -452,10 +452,27 @@ async function addRepo() {
 
 async function runDiscovery() {
   if (!currentRepo) return toast('Select a repo first');
-  toast('Running discovery...');
+  toast('Running discovery (agent analysis in background)...');
   const data = await api('/api/v1/repos/' + currentRepo + '/discover', { method: 'POST' });
-  toast('Discovery complete: ' + data.count + ' task(s) found');
-  setTimeout(() => loadRepo(), 500);
+  if (data.message) toast(data.message);
+  // Poll for completion
+  pollDiscovery();
+}
+
+function pollDiscovery() {
+  if (!currentRepo) return;
+  const poll = setInterval(async () => {
+    try {
+      const st = await api('/api/v1/repos/' + currentRepo + '/discover/status');
+      if (!st.running) {
+        clearInterval(poll);
+        toast('Discovery complete! Refreshing...');
+        loadRepo();
+      }
+    } catch { clearInterval(poll); }
+  }, 5000);
+  // Auto-stop polling after 10 min
+  setTimeout(() => clearInterval(poll), 600000);
 }
 
 async function seedDemo() {

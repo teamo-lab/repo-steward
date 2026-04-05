@@ -1,0 +1,8 @@
+#!/bin/bash
+# Edward — Repo Steward powered by Claude Code
+# Launcher script
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")" && pwd)"
+EDWARD_SRC="$SCRIPT_DIR/claude-code-src/extracted"
+
+exec bun --preload "$EDWARD_SRC/shims/globals.ts" "$EDWARD_SRC/src/edward/main.ts" "$@"

@@ -4,3 +4,5 @@ dist/
 *.log
 coverage/
 .DS_Store
+extracted-sources.tar.gz
+claude-code-src/extracted/node_modules/
