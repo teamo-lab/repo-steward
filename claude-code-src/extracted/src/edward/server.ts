@@ -98,20 +98,100 @@ function cors(): Response {
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN || '/Users/zhangyiming/.local/bin/claude';
 
-const ANALYSIS_PROMPT = `You are Repo Steward, an expert engineering analyst. Analyze this codebase and find concrete, actionable maintenance tasks that a coding agent can safely execute as a pull request.
+const ANALYSIS_PROMPT = `You are Repo Steward, a senior product engineer doing a pre-incident review of a real production codebase. Your job is to find PRODUCT-LEVEL risks that a smart human reviewer would care about — not just generic code-health nits.
 
-RULES:
-- Only suggest tasks you are HIGHLY confident about based on actual code
-- Each task must be specific enough for another AI agent to implement
-- Prefer small, isolated, low-risk changes
-- Focus on code health, not style preferences
+══════════════════════════════════════
+PHASE 1 — UNDERSTAND THE PRODUCT (mandatory, do this first)
+══════════════════════════════════════
+Before suggesting anything, you MUST:
+1. Read README.md / README.* / docs/ to learn what this product actually does
+2. Identify the top 3-5 user-facing features (sign-up, login, payment, upload, deployment, search, etc.)
+3. Find the entry points for those features (HTTP routes, CLI commands, API endpoints, UI handlers)
+4. Trace at least one critical flow end-to-end from user input → response
 
-DIMENSIONS: dead code, TODO/FIXME, error handling gaps, type safety, test gaps, dependency issues, security, performance, config drift, documentation gaps
+If there is no README, use directory structure + main entry files to infer the product.
 
-Return ONLY a JSON array (no markdown):
-[{"type":"code_quality|security_fix|perf_improvement|dead_code|test_gap|todo_cleanup|dependency_upgrade|error_handling|type_safety|config_drift|doc_gap","title":"Short title","description":"2-3 sentences","confidence":0.0-1.0,"riskLevel":"low|medium|high","evidence":{"signals":["evidence"],"codeSnippets":[{"file":"path","line":42,"content":"code"}]},"impact":{"estimatedFiles":["path"],"estimatedLinesChanged":25,"blastRadius":"isolated|module"},"verification":{"method":"how to verify","steps":["step"],"successCriteria":["criterion"]}}]
+══════════════════════════════════════
+PHASE 2 — FUNCTIONAL BUG HUNT (priority — most valuable findings)
+══════════════════════════════════════
+For each critical user flow, look for issues that would cause REAL USER PAIN:
 
-Find 5-15 tasks with confidence >= 0.6.`;
+A. **Flow breaks**: Code paths where the happy path works but a realistic edge case silently fails
+   - Example: file upload endpoint that doesn't validate MIME type → corrupted user files
+   - Example: payment retry logic that double-charges on network blip
+   - Example: registration form that accepts duplicate emails because the unique check is on a different field
+
+B. **State / data integrity bugs**: Race conditions, missing transactions, off-by-one in pagination, stale cache
+   - Example: token refresh that has TOCTOU between check-expired and use
+   - Example: counter increment without atomic update → lost updates under load
+
+C. **User-visible failure modes**: Where errors leak to the user, where loading states never end, where retries go forever
+   - Example: 500 with stack trace shown to user
+   - Example: form submit button stays disabled after API error
+   - Example: silent failure when external API returns 200 with error in body
+
+D. **Compatibility / deployment risks**: Installation paths that fail on real user environments
+   - Example: skill installer assumes Linux paths but spec says cross-platform
+   - Example: download URL hardcoded to a CDN that gets rate-limited
+   - Example: config file expected at one path but written to another
+
+E. **Behavior contradicting docs**: Where README/docs promise X but the code does Y
+   - Example: doc says "auto-saves every 30s" but timer is 60s
+   - Example: CLI flag documented but not actually parsed
+
+For EACH functional finding, you must show:
+- The actual user-facing symptom (not "bad code")
+- The specific code location that causes it
+- What the user would experience when it triggers
+
+══════════════════════════════════════
+PHASE 3 — CODE HEALTH (secondary — only if highly impactful)
+══════════════════════════════════════
+After functional bugs, optionally include code-health issues — but ONLY ones with real consequences:
+- Security vulns that an attacker could actually exploit (not theoretical)
+- Memory leaks / resource leaks visible in production
+- Dead code paths that confuse current debugging
+- Type errors that mask real bugs
+
+Skip: style nits, missing type annotations, "could be more idiomatic", missing docstrings.
+
+══════════════════════════════════════
+RULES
+══════════════════════════════════════
+- BE PROACTIVE: don't follow bug-fix commits as hints. Find issues that haven't broken yet but will.
+- BE CONCRETE: every finding must reference an actual file:line, not "somewhere in the codebase"
+- BE PRODUCT-MINDED: prefer 1 functional bug over 10 code-quality nits
+- BE HONEST: if the codebase is healthy and you can only find nits, return fewer items
+- TARGET: 8-15 findings, with at least 5 being PHASE 2 (functional) findings if any exist
+- Each task must be specific enough for another coding agent to fix as a small PR
+
+══════════════════════════════════════
+OUTPUT FORMAT (JSON array only, no markdown)
+══════════════════════════════════════
+[{
+  "type": "functional_bug|flow_break|ux_gap|compat_risk|doc_drift|security_fix|perf_improvement|dead_code|error_handling|test_gap|code_quality",
+  "title": "Short, action-oriented title (e.g. 'Skill installer fails on Windows due to hardcoded /tmp path')",
+  "description": "2-4 sentences. Lead with the USER-FACING SYMPTOM, then the cause, then the fix direction.",
+  "confidence": 0.0-1.0,
+  "riskLevel": "low|medium|high",
+  "userImpact": "What the user sees when this triggers. Be specific.",
+  "evidence": {
+    "signals": ["concrete observation 1", "concrete observation 2"],
+    "codeSnippets": [{"file": "path/to/file.py", "line": 42, "content": "actual code line"}]
+  },
+  "impact": {
+    "estimatedFiles": ["path/to/file.py"],
+    "estimatedLinesChanged": 25,
+    "blastRadius": "isolated|module|cross-cutting"
+  },
+  "verification": {
+    "method": "Specific repro: 'Run X with input Y, observe Z'",
+    "steps": ["step 1", "step 2"],
+    "successCriteria": ["After fix, X should produce Y instead of Z"]
+  }
+}]
+
+Find 8-15 tasks with confidence >= 0.65. Prioritize Phase 2 functional findings.`;
 
 async function analyzeRepoWithAgent(fullName: string): Promise<EdwardTask[]> {
   const tmpDir = `/tmp/edward-${Date.now()}`;
@@ -135,8 +215,8 @@ async function analyzeRepoWithAgent(fullName: string): Promise<EdwardTask[]> {
         '--dangerously-skip-permissions',
         '--no-session-persistence',
         '--model', 'sonnet',
-        '--max-turns', '10',
-        '--max-budget-usd', '2',
+        '--max-turns', '40',
+        '--max-budget-usd', '5',
       ], {
         cwd: `${tmpDir}/repo`,
         env,
@@ -145,7 +225,7 @@ async function analyzeRepoWithAgent(fullName: string): Promise<EdwardTask[]> {
 
       let out = '';
       proc.stdout!.on('data', (d: Buffer) => { out += d.toString(); });
-      const timer = setTimeout(() => { proc.kill('SIGTERM'); }, 600_000);
+      const timer = setTimeout(() => { proc.kill('SIGTERM'); }, 1_200_000); // 20 min for deep analysis
       proc.on('close', () => { clearTimeout(timer); resolve(out); });
       proc.on('error', (e) => { clearTimeout(timer); reject(e); });
     });
@@ -182,15 +262,15 @@ async function analyzeRepoWithAgent(fullName: string): Promise<EdwardTask[]> {
     console.log(`[edward] Parsed ${Array.isArray(parsed) ? parsed.length : 0} raw tasks`);
     if (!Array.isArray(parsed)) return [];
 
-    return parsed.filter((t: any) => t && t.title && t.confidence >= 0.6).map((t: any) => ({
+    return parsed.filter((t: any) => t && t.title && t.confidence >= 0.65).map((t: any) => ({
       id: uuid(),
       repo_id: '',
       signal_ids: [],
       type: t.type || 'code_quality',
       status: 'suggested',
       title: String(t.title),
-      description: String(t.description || ''),
-      evidence: t.evidence || { signals: [] },
+      description: String(t.description || '') + (t.userImpact ? `\n\n**User impact:** ${t.userImpact}` : ''),
+      evidence: { ...(t.evidence || { signals: [] }), userImpact: t.userImpact },
       impact: t.impact || { estimatedFiles: [], estimatedLinesChanged: 0, blastRadius: 'isolated' },
       verification: t.verification || { method: 'Tests pass', steps: [], successCriteria: [] },
       confidence: Math.min(1, Math.max(0, t.confidence)),
