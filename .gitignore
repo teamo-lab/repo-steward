@@ -12,3 +12,7 @@ bun.lockb
 
 # Local dev session archives (not for publication)
 sessions/
+
+# Agent Team workspace — Planner/Generator/Evaluator working files.
+# Per CLAUDE.md, only source code ships; feature artifacts stay local.
+.agent-team/
