@@ -15,7 +15,14 @@ is deliberately tiny:
 - ~1.1k LOC across three TypeScript files under `src/edward/`
 - Runtime: **Bun ≥ 1.1** (not Node) — do not introduce Node-only APIs
 - Zero runtime dependencies — check `package.json`, it lists none
-- **In-memory state**, no Postgres/Redis/SQLite
+- **Ephemeral state by default.** All `repos`/`tasks`/`executions` live
+  in `Map`s and reset on restart. Optional `~/.edward/seed.json`
+  re-adds known repos at startup. Real persistence (SQLite, Postgres,
+  etc.) is **not forbidden**, but the bar is high: a mini-PRD with
+  evidence of pain (e.g. "I have 30 repos and re-add costs me 5 min
+  per restart" or "I need historical task analytics"). Don't add a
+  database to make a 5-line annoyance go away — there are cheaper
+  fixes (seed file, recompute, document the behavior).
 - Shells out to the `claude` CLI binary (`CLAUDE_BIN`) for analysis; it
   is not a fork of any Claude codebase
 - HTTP server = `Bun.serve`, **not Fastify/Express**
