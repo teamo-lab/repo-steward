@@ -94,6 +94,118 @@ function cors(): Response {
   });
 }
 
+// ── Repo add helper (shared by POST handler + seed loader) ──
+
+type AddRepoResult =
+  | { ok: true; repo: EdwardRepo; created: boolean }
+  | { ok: false; status: number; error: string };
+
+async function addRepoByFullName(fullName: string): Promise<AddRepoResult> {
+  // Strict owner/repo validation — prevents path traversal into the GitHub API URL
+  // and rejects garbage like "foo/bar/baz" or "/foo" up front.
+  if (!fullName || !/^[A-Za-z0-9][A-Za-z0-9-_.]*\/[A-Za-z0-9][A-Za-z0-9-_.]*$/.test(fullName)) {
+    return { ok: false, status: 400, error: `full_name must match owner/repo (got: ${fullName})` };
+  }
+
+  const existing = [...repos.values()].find(r => r.full_name === fullName);
+  if (existing) return { ok: true, repo: existing, created: false };
+
+  const [owner, name] = fullName.split('/');
+
+  // Verify the repo actually exists on GitHub before adding it. Without this,
+  // typos silently create phantom repos that later fail at clone time.
+  const ghHeaders: Record<string, string> = {
+    Accept: 'application/vnd.github.v3+json',
+    'User-Agent': 'edward',
+  };
+  if (process.env.GITHUB_TOKEN) ghHeaders.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+
+  let res: Response;
+  try {
+    res = await fetch(`https://api.github.com/repos/${owner}/${name}`, { headers: ghHeaders });
+  } catch (err) {
+    return {
+      ok: false,
+      status: 502,
+      error: `Could not reach GitHub to verify repo: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  if (res.status === 404) return { ok: false, status: 404, error: `Repository not found on GitHub: ${fullName}` };
+  if (res.status === 403) return { ok: false, status: 403, error: 'GitHub API rate-limited or forbidden. Set GITHUB_TOKEN to increase the limit.' };
+  if (!res.ok) return { ok: false, status: 502, error: `GitHub API returned ${res.status} for ${fullName}` };
+
+  const d = await res.json() as any;
+  const repo: EdwardRepo = {
+    id: uuid(),
+    github_id: d.id,
+    owner,
+    name,
+    full_name: fullName,
+    installation_id: '0',
+    default_branch: d.default_branch || 'main',
+    language: d.language || 'Unknown',
+    is_active: true,
+    settings: {},
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+  repos.set(repo.id, repo);
+  return { ok: true, repo, created: true };
+}
+
+// ── Seed file: re-add known repos at startup ──
+//
+// Edward keeps state in memory by design. To avoid the "re-add the same
+// repos every restart" tax, an optional ~/.edward/seed.json (overridable
+// via EDWARD_SEED_FILE) lists owner/name strings to load at boot.
+//
+// Schema:    {"repos": ["owner/name", ...]}
+// Failures:  individual entries log a warning and are skipped — never crash.
+// Loading:   fire-and-forget after Bun.serve binds, so the dashboard URL
+//            appears immediately.
+
+async function loadSeedFile(): Promise<void> {
+  const home = process.env.HOME || '';
+  let seedPath = process.env.EDWARD_SEED_FILE || join(home, '.edward', 'seed.json');
+  if (seedPath.startsWith('~/')) seedPath = join(home, seedPath.slice(2));
+
+  if (!existsSync(seedPath)) return;
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(readFileSync(seedPath, 'utf-8'));
+  } catch (err: any) {
+    console.warn(`[edward] seed: invalid JSON at ${seedPath}: ${err.message}`);
+    return;
+  }
+
+  const list = parsed?.repos;
+  if (!Array.isArray(list)) {
+    console.warn(`[edward] seed: ${seedPath} missing "repos" array`);
+    return;
+  }
+
+  console.log(`[edward] seed: loading ${list.length} repos from ${seedPath}`);
+  let ok = 0, fail = 0;
+  for (const entry of list) {
+    if (typeof entry !== 'string') {
+      console.warn(`[edward] seed: skipping non-string entry: ${JSON.stringify(entry)}`);
+      fail++;
+      continue;
+    }
+    const result = await addRepoByFullName(entry);
+    if (result.ok) {
+      ok++;
+      console.log(`[edward] seed: + ${entry}${result.created ? '' : ' (already loaded)'}`);
+    } else {
+      fail++;
+      console.warn(`[edward] seed: ✗ ${entry} — ${result.error}`);
+    }
+  }
+  console.log(`[edward] seed: done. ${ok} loaded, ${fail} failed.`);
+}
+
 // ── Agent analysis using claude CLI ──
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN || '/Users/zhangyiming/.local/bin/claude';
@@ -326,59 +438,9 @@ async function handleRequest(req: Request): Promise<Response> {
 
   if (path === '/api/v1/repos' && method === 'POST') {
     const body = await req.json() as { full_name: string };
-    // Strict owner/repo validation — prevents path traversal into the GitHub API URL
-    // and rejects garbage like "foo/bar/baz" or "/foo" up front.
-    if (!body.full_name || !/^[A-Za-z0-9][A-Za-z0-9-_.]*\/[A-Za-z0-9][A-Za-z0-9-_.]*$/.test(body.full_name)) {
-      return json({ error: 'full_name must match owner/repo (got: ' + body.full_name + ')' }, 400);
-    }
-    const existing = [...repos.values()].find(r => r.full_name === body.full_name);
-    if (existing) return json({ repo: existing, created: false });
-
-    const [owner, name] = body.full_name.split('/');
-
-    // Verify the repo actually exists on GitHub before adding it. Without this,
-    // typos silently create phantom repos that later fail at clone time.
-    let githubId: number;
-    let language = 'Unknown';
-    let defaultBranch = 'main';
-
-    const ghHeaders: Record<string, string> = {
-      Accept: 'application/vnd.github.v3+json',
-      'User-Agent': 'edward',
-    };
-    if (process.env.GITHUB_TOKEN) ghHeaders.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
-
-    let res: Response;
-    try {
-      res = await fetch(`https://api.github.com/repos/${owner}/${name}`, { headers: ghHeaders });
-    } catch (err) {
-      return json({
-        error: `Could not reach GitHub to verify repo: ${err instanceof Error ? err.message : String(err)}`,
-      }, 502);
-    }
-
-    if (res.status === 404) {
-      return json({ error: `Repository not found on GitHub: ${body.full_name}` }, 404);
-    }
-    if (res.status === 403) {
-      return json({ error: 'GitHub API rate-limited or forbidden. Set GITHUB_TOKEN to increase the limit.' }, 403);
-    }
-    if (!res.ok) {
-      return json({ error: `GitHub API returned ${res.status} for ${body.full_name}` }, 502);
-    }
-
-    const d = await res.json() as any;
-    githubId = d.id;
-    language = d.language || 'Unknown';
-    defaultBranch = d.default_branch || 'main';
-
-    const repo: EdwardRepo = {
-      id: uuid(), github_id: githubId, owner, name, full_name: body.full_name,
-      installation_id: '0', default_branch: defaultBranch, language, is_active: true,
-      settings: {}, created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
-    };
-    repos.set(repo.id, repo);
-    return json({ repo, created: true }, 201);
+    const result = await addRepoByFullName(body.full_name);
+    if (!result.ok) return json({ error: result.error }, result.status);
+    return json({ repo: result.repo, created: result.created }, result.created ? 201 : 200);
   }
 
   // Repo by ID
@@ -534,6 +596,8 @@ export function startEdwardServer(port = 8080): void {
   });
   console.log(`\n  ◆ Edward Dashboard: http://localhost:${server.port}/`);
   console.log(`    API: http://localhost:${server.port}/api/v1/repos\n`);
+  // Fire-and-forget seed load — never blocks startup, never crashes the server.
+  loadSeedFile().catch((err) => console.error(`[edward] seed: load crashed: ${err?.message || err}`));
 }
 
 export { repos, tasks, executions };
