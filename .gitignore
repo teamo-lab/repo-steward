@@ -1,0 +1,14 @@
+.env
+*.log
+.DS_Store
+
+# Bun / node
+node_modules/
+bun.lockb
+
+# Editor
+.vscode/
+.idea/
+
+# Local dev session archives (not for publication)
+sessions/

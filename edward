@@ -1,0 +1,18 @@
+#!/bin/bash
+# Edward — proactive repo-maintenance agent (Repo Steward).
+# Launcher script: shells out to the `claude` CLI binary for analysis.
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")" && pwd)"
+
+# Auto-detect GitHub token: use GITHUB_TOKEN if set, else fall back to `gh auth token`.
+# Private repos return 404 to unauthenticated callers, so edward needs a token to
+# verify them during `repos add`.
+if [ -z "$GITHUB_TOKEN" ] && command -v gh >/dev/null 2>&1; then
+  _gh_tok="$(gh auth token 2>/dev/null)"
+  if [ -n "$_gh_tok" ]; then
+    export GITHUB_TOKEN="$_gh_tok"
+  fi
+  unset _gh_tok
+fi
+
+exec bun "$SCRIPT_DIR/src/edward/main.ts" "$@"

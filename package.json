@@ -1,0 +1,22 @@
+{
+  "name": "edward",
+  "version": "0.4.0",
+  "description": "Edward — proactive repo maintenance agent. Finds, ranks, and executes safe maintenance work across your repos by shelling out to the Claude CLI.",
+  "type": "module",
+  "bin": {
+    "edward": "./edward"
+  },
+  "scripts": {
+    "start": "./edward serve",
+    "dev": "./edward serve --port 8080"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/teamo-lab/repo-steward.git"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
