@@ -5,10 +5,10 @@
  * Uses Bun's native HTTP server (no Fastify needed in the edward build).
  */
 
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawn, spawnSync, execSync } from 'node:child_process';
+import { spawn, execSync } from 'node:child_process';
 import { detectRepoProfile, type RepoProfile } from './profile.js';
 import { extractCIRawConfig, type CIRawConfig } from './ci_extract.js';
 
@@ -641,83 +641,6 @@ ${JSON.stringify(ciFilesForPrompt, null, 2)}${ciFilesNote}
 }
 
 /**
- * Clone a public or private GitHub repo at depth 1.
- *
- * If GITHUB_TOKEN is set, authenticate via `git -c http.extraheader=...`
- * with HTTP Basic auth (`x-access-token:<TOKEN>` base64-encoded). This
- * is the form git's smart-HTTP protocol actually accepts — Bearer / token
- * headers work for the GitHub REST API but git-upload-pack will silently
- * fall back to interactive credential prompt and time out.
- *
- * The token never goes into the URL, the shell, or git config — only
- * into the spawn argv, visible only to root / same-uid processes.
- *
- * Throws on clone failure. Caller's outer try/catch handles cleanup.
- */
-function cloneRepoWithToken(fullName: string, dest: string): void {
-  const url = `https://github.com/${fullName}.git`;
-  const args: string[] = [];
-  const token = process.env.GITHUB_TOKEN;
-  if (token) {
-    const basic = Buffer.from(`x-access-token:${token}`).toString('base64');
-    args.push('-c', `http.extraheader=Authorization: Basic ${basic}`);
-  }
-  args.push('clone', '--depth', '1', url, dest);
-
-  const result = spawnSync('git', args, {
-    timeout: 60_000,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  if (result.error) throw result.error;
-  if (result.status !== 0) {
-    const stderr = (result.stderr?.toString() || '').slice(0, 500);
-    throw new Error(`git clone failed (exit ${result.status}): ${stderr}`);
-  }
-}
-
-/**
- * Find the first balanced JSON value (`{...}` or `[...]`) starting at
- * the first matching opener in `text`. Walks character by character,
- * tracking string state and escapes so quoted braces / brackets don't
- * fool the depth counter.
- *
- * This replaces the previous regex-based parser, which had two failure
- * modes:
- *   1. Non-greedy code-fence regex truncated at the first nested ``` —
- *      losing every finding when Claude's description embedded a yaml
- *      example.
- *   2. Greedy `\{[\s\S]*\}` over-matched into trailing prose containing
- *      `${{ secrets.X }}` — choking the parser on the trailing garbage.
- *
- * Returns null if no balanced value is found.
- */
-function findFirstBalancedJson(text: string, open: '{' | '['): string | null {
-  const close = open === '{' ? '}' : ']';
-  const startIdx = text.indexOf(open);
-  if (startIdx < 0) return null;
-
-  let depth = 0;
-  let inString = false;
-  let escape = false;
-  for (let i = startIdx; i < text.length; i++) {
-    const ch = text[i];
-    if (escape) { escape = false; continue; }
-    if (inString) {
-      if (ch === '\\') escape = true;
-      else if (ch === '"') inString = false;
-      continue;
-    }
-    if (ch === '"') { inString = true; continue; }
-    if (ch === open) depth++;
-    else if (ch === close) {
-      depth--;
-      if (depth === 0) return text.slice(startIdx, i + 1);
-    }
-  }
-  return null;
-}
-
-/**
  * Convert a raw task object from the LLM output into an EdwardTask.
  * Defensive — every field has a default, never throws on weird shapes.
  */
@@ -761,11 +684,11 @@ async function analyzeRepoWithAgent(
   const tmpDir = `/tmp/edward-${Date.now()}`;
 
   try {
-    // Clone — pass GITHUB_TOKEN via http.extraheader so private repos
-    // and rate-limited unauthenticated egress paths actually work.
-    // We deliberately do NOT embed the token in the URL: that leaks it
-    // into process listings, error messages, and git config.
-    cloneRepoWithToken(fullName, `${tmpDir}/repo`);
+    // Clone
+    execSync(`git clone --depth 1 https://github.com/${fullName}.git ${tmpDir}/repo`, {
+      timeout: 60_000,
+      stdio: 'pipe',
+    });
 
     // Layer 1 + 2: profile and CI extraction
     const profile = detectRepoProfile(`${tmpDir}/repo`);
@@ -856,16 +779,11 @@ interface ParsedAnalysis {
 /**
  * Tolerant parser for the LLM analysis output.
  *
- * Strategy: try in order, take the first that produces a usable shape:
- *   1. Direct JSON.parse of the trimmed text
- *   2. First balanced `{...}` found anywhere in the text (handles
- *      markdown-wrapped responses + trailing prose + nested code fences
- *      inside string values)
- *   3. First balanced `[...]` (legacy v0.3 flat-array shape)
- *
- * If everything fails, dump the raw text to /tmp/edward-parse-failure-<ts>.txt
- * and log the path so the failure is debuggable without re-running the
- * (expensive) discover. Returns the empty shape on total failure.
+ * Tries:
+ *   1. Direct JSON parse of the new shape: {ci_scorecard, ci_findings, phase_1_2_3_findings}
+ *   2. JSON in a markdown code block
+ *   3. Bare JSON object anywhere in the text
+ *   4. Bare JSON array (legacy v0.3 flat shape — treat as phase_1_2_3_findings)
  *
  * Never throws.
  */
@@ -874,23 +792,19 @@ function parseAnalysisResult(text: string): ParsedAnalysis {
 
   const tryShape = (parsed: any): ParsedAnalysis | null => {
     if (!parsed) return null;
-    // New shape: object with at least one of the three expected keys
+    // New shape (object with the three keys)
     if (typeof parsed === 'object' && !Array.isArray(parsed)) {
       const ci = Array.isArray(parsed.ci_findings) ? parsed.ci_findings : [];
       const p123 = Array.isArray(parsed.phase_1_2_3_findings) ? parsed.phase_1_2_3_findings : [];
       const scorecard: CIScorecard | null = parsed.ci_scorecard && typeof parsed.ci_scorecard === 'object'
         ? parsed.ci_scorecard
         : null;
+      // If we got at least one of the expected keys, use this shape
       if (ci.length > 0 || p123.length > 0 || scorecard) {
         return { ci_findings: ci, phase_1_2_3_findings: p123, scorecard };
       }
-      // Object that doesn't match the new shape — give up on this attempt
-      // (don't fall through to "treat as phase_1_2_3" here, the wrong-shape
-      // object would be silently dropped which is exactly the bug we're
-      // fixing).
-      return null;
     }
-    // Legacy flat array of tasks
+    // Legacy flat array
     if (Array.isArray(parsed)) {
       return { ci_findings: [], phase_1_2_3_findings: parsed, scorecard: null };
     }
@@ -899,47 +813,42 @@ function parseAnalysisResult(text: string): ParsedAnalysis {
 
   // Attempt 1: direct parse
   try {
-    const parsed = JSON.parse(text.trim());
+    const parsed = JSON.parse(text);
     const shaped = tryShape(parsed);
     if (shaped) return shaped;
   } catch { /* try next */ }
 
-  // Attempt 2: first balanced {...} object anywhere in the text
-  const objSlice = findFirstBalancedJson(text, '{');
-  if (objSlice) {
+  // Attempt 2: code block
+  const codeMatch = text.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
+  if (codeMatch && codeMatch[1]) {
     try {
-      const parsed = JSON.parse(objSlice);
+      const parsed = JSON.parse(codeMatch[1]);
       const shaped = tryShape(parsed);
       if (shaped) return shaped;
     } catch { /* try next */ }
   }
 
-  // Attempt 3: first balanced [...] array (legacy v0.3 shape)
-  const arrSlice = findFirstBalancedJson(text, '[');
-  if (arrSlice) {
+  // Attempt 3: bare object
+  const objMatch = text.match(/\{[\s\S]*\}/);
+  if (objMatch) {
     try {
-      const parsed = JSON.parse(arrSlice);
+      const parsed = JSON.parse(objMatch[0]);
+      const shaped = tryShape(parsed);
+      if (shaped) return shaped;
+    } catch { /* try next */ }
+  }
+
+  // Attempt 4: bare array (legacy)
+  const arrMatch = text.match(/\[[\s\S]*\]/);
+  if (arrMatch) {
+    try {
+      const parsed = JSON.parse(arrMatch[0]);
       const shaped = tryShape(parsed);
       if (shaped) return shaped;
     } catch { /* fall through */ }
   }
 
-  // Total failure: dump raw text for offline debugging.
-  // Edward is expensive to re-run ($1+, ~7 min) so silent failures are
-  // very costly. Dumping the raw text means the user can `cat` the
-  // file, see what Claude actually returned, and (in the worst case)
-  // hand-extract findings or rerun with a different prompt — without
-  // burning another scan.
-  try {
-    const ts = new Date().toISOString().replace(/[:.]/g, '-');
-    const dumpPath = `/tmp/edward-parse-failure-${ts}.txt`;
-    writeFileSync(dumpPath, text, 'utf-8');
-    console.error(`[edward] Could not parse Claude output as the expected shape.`);
-    console.error(`[edward] Raw output dumped to: ${dumpPath}`);
-    console.error(`[edward]   inspect with: cat ${dumpPath}`);
-  } catch (dumpErr: any) {
-    console.error(`[edward] Could not parse Claude output, AND dump failed: ${dumpErr?.message || dumpErr}`);
-  }
+  console.error(`[edward] Could not parse Claude output as the expected shape — returning empty`);
   return empty;
 }
 
