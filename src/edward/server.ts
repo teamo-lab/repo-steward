@@ -426,22 +426,11 @@ PHASE 1 — UNDERSTAND THE PRODUCT (mandatory before phases 2-3)
 ══════════════════════════════════════
 Before suggesting product bugs, you MUST:
 1. Read README.md / README.* / docs/ to learn what this product actually does
-2. Identify EVERY user-facing feature you can find — sign-up, login,
-   payment, upload, deployment, search, settings, admin actions,
-   notifications, billing, exports, integrations, etc. Do not pick a
-   top-N subset. Aim for completeness; if you find 12 features list
-   all 12.
-3. Find the entry points for ALL of them (HTTP routes, CLI commands,
-   API endpoints, UI handlers, scheduled jobs, webhooks, queue
-   consumers)
-4. Trace EVERY critical flow you can identify end-to-end from user
-   input → response. A critical flow is anything where a regression
-   would cause a user-visible failure or data integrity issue.
+2. Identify the top 3-5 user-facing features (sign-up, login, payment, upload, deployment, search, etc.)
+3. Find the entry points for those features (HTTP routes, CLI commands, API endpoints, UI handlers)
+4. Trace at least one critical flow end-to-end from user input → response
 
-If there is no README, use directory structure + main entry files to
-infer the product. Use route registries (FastAPI APIRouter, Express
-app.use, Next.js pages/api, Go gin.Engine, Rust router::new etc.) to
-build a complete entry-point inventory before moving to Phase 2.
+If there is no README, use directory structure + main entry files to infer the product.
 
 ══════════════════════════════════════
 PHASE 2 — FUNCTIONAL BUG HUNT (priority — most valuable findings)
@@ -537,15 +526,9 @@ RULES
 - BE PROACTIVE: don't follow bug-fix commits as hints. Find issues that haven't broken yet but will.
 - BE CONCRETE: every finding must reference an actual file:line, not "somewhere in the codebase"
 - BE PRODUCT-MINDED: prefer 1 functional bug over 10 code-quality nits
-- BE HONEST: if the codebase is healthy and you genuinely cannot find
-  any high-confidence issue in a category, return zero items for that
-  category. Do not invent or pad.
-- BE EXHAUSTIVE: there is NO upper limit on findings per category.
-  Report every issue you find with confidence ≥ 0.7. If a real
-  codebase has 25 high-confidence functional bugs, return 25. Do not
-  pick a "top N" subset — silently dropping bugs makes Edward
-  non-deterministic across runs and that is the worst possible
-  failure mode for a quality-audit tool.
+- BE HONEST: if the codebase is healthy and you can only find nits, return fewer items
+- TARGET: 5-8 ci_* findings + 5-10 phase_1_2_3 findings (fewer if the
+  repo genuinely doesn't have problems in that category)
 - Each task must be specific enough for another coding agent to fix as a small PR
 - All ci_* findings come from Phase 0
 - All phase_1_2_3 findings come from Phases 1-3
@@ -615,13 +598,8 @@ CIScorecard schema:
   ]
 }
 
-Confidence threshold: only emit findings with confidence >= 0.7.
-There is NO upper bound on the number of findings — emit every
-finding that crosses the threshold. Sort by confidence descending
-within each category, but do not truncate.
-
-Prioritize Phase 0 (CI gaps) and Phase 2 (functional bugs) when
-exploration time is limited, but do not skip categories entirely.
+Confidence threshold: only emit findings with confidence >= 0.65.
+Prioritize Phase 0 (CI gaps) and Phase 2 (functional bugs).
 
 REMINDER: respond with the JSON object only. No prose, no markdown, no code fence.`;
 
@@ -745,10 +723,7 @@ function findFirstBalancedJson(text: string, open: '{' | '['): string | null {
  */
 function toEdwardTask(t: any): EdwardTask | null {
   if (!t || typeof t !== 'object' || !t.title) return null;
-  // Confidence threshold raised from 0.65 to 0.7 to cut the "edge"
-  // findings that flip on/off across runs (the 0.62-0.68 band was the
-  // main source of run-to-run variance).
-  if (typeof t.confidence !== 'number' || t.confidence < 0.7) return null;
+  if (typeof t.confidence !== 'number' || t.confidence < 0.65) return null;
 
   return {
     id: uuid(),
@@ -821,9 +796,7 @@ async function analyzeRepoWithAgent(
         '--dangerously-skip-permissions',
         '--no-session-persistence',
         '--model', 'sonnet',
-        // 80 turns: prior 40-turn cap was hitting before exploration finished
-        // on real codebases. Budget cap ($5) is the second safety net.
-        '--max-turns', '80',
+        '--max-turns', '40',
         '--max-budget-usd', '5',
       ], {
         cwd: `${tmpDir}/repo`,
@@ -1033,9 +1006,7 @@ async function handleRequest(req: Request): Promise<Response> {
     const repoTasks = [...tasks.values()]
       .filter(t => t.repo_id === suggestMatch[1] && t.status === 'suggested')
       .sort((a, b) => b.confidence - a.confidence)
-      // Slice raised from 10 to 30 to match the expanded SAVE_CAP and
-      // expose long-tail findings in the primary "Suggestions" view.
-      .slice(0, 30);
+      .slice(0, 10);
     return json({
       suggestions: repoTasks.map(task => ({
         task,
@@ -1081,12 +1052,10 @@ async function handleRequest(req: Request): Promise<Response> {
           repo.updated_at = new Date().toISOString();
         }
 
-        // Save tasks (with dedupe). Cap raised from 15 to 50 to
-        // accommodate exhaustive scans (no per-category quota anymore;
-        // a real codebase like clawschool with multiple security +
-        // payment + auth issues can produce 25+ findings legitimately).
+        // Save tasks (with dedupe). Cap raised from 10 to 15 to fit
+        // CI findings + product findings without truncating either category.
         let saved = 0;
-        const SAVE_CAP = 50;
+        const SAVE_CAP = 15;
         for (const at of result.tasks) {
           const dup = [...tasks.values()].find(
             t => t.repo_id === repo.id && t.type === at.type && t.title === at.title && !['dismissed', 'merged', 'failed'].includes(t.status)
