@@ -11,7 +11,6 @@ import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync, execSync } from 'node:child_process';
 import { detectRepoProfile, type RepoProfile } from './profile.js';
 import { extractCIRawConfig, type CIRawConfig } from './ci_extract.js';
-import { detectHotModules, type HotModule } from './hot_modules.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DASHBOARD_HTML_PATH = join(__dirname, 'dashboard.html');
@@ -445,54 +444,6 @@ app.use, Next.js pages/api, Go gin.Engine, Rust router::new etc.) to
 build a complete entry-point inventory before moving to Phase 2.
 
 ══════════════════════════════════════
-PHASE 1.5 — MANDATORY HOT-MODULE DEEP-DIVE (run BEFORE Phase 2)
-══════════════════════════════════════
-
-You will be given a HOT_MODULES list at the bottom of this prompt
-(possibly empty). Each entry is a file path that machine signals
-(git change frequency, test coverage, complexity) have flagged as
-high-risk for THIS specific repo right now.
-
-For EVERY hot module in the list, you MUST:
-
-1. Read the entire file (or all relevant sections if it is large).
-2. Trace every public function / endpoint / handler defined in it
-   end-to-end. Follow the data flow into and out of each call.
-3. Specifically check the edge cases that hot modules are most
-   likely to have:
-   - Boundary conditions: scores going DOWN after upgrades, ties,
-     negative values, zero, max-int, off-by-one in pagination.
-   - Idempotency: what happens if this endpoint / callback is
-     called twice with the same input? Lost updates? Double charges?
-     Lost points?
-   - State machine transitions: can the entity reach a state that
-     wasn't explicitly designed for? Stale "expired" → "pending"?
-     "completed" before "submitted"?
-   - Race conditions: TOCTOU between check and write, missing
-     transactions, lost updates under concurrent load.
-   - Auth bypass: does the function check authorization on EVERY
-     entry point? Including the legacy ones?
-   - Input validation: every parameter from outside (HTTP form,
-     query string, JSON body, URL path) — what if it's missing,
-     wrong type, malicious payload, very long, unicode?
-   - Cross-flow leakage: can user A read user B's data through
-     this code path?
-
-4. For each issue found, emit a finding in phase_1_2_3_findings
-   with userImpact specifying exactly what the user sees.
-
-The hot modules list is the single most reliable signal Edward has
-for "where the bugs are most likely to be hiding right now". A
-finding missed in a hot module is a much worse failure than missing
-something in a cold module — it means a real production bug in code
-that everyone has been touching has slipped through anyway.
-
-You may NOT skip a hot module because "it looks fine" or "I already
-have enough findings in that area". The list is mandatory and
-exhaustive. After you have completed every hot module, then proceed
-to Phase 2 free exploration of the rest of the codebase.
-
-══════════════════════════════════════
 PHASE 2 — FUNCTIONAL BUG HUNT (priority — most valuable findings)
 ══════════════════════════════════════
 For each critical user flow, look for issues that would cause REAL USER PAIN:
@@ -682,11 +633,10 @@ REMINDER: respond with the JSON object only. No prose, no markdown, no code fenc
 function buildAnalysisPrompt(
   profile: RepoProfile,
   ciRaw: CIRawConfig,
-  hotModules: HotModule[],
   opts?: { skipProduct?: boolean }
 ): string {
   const skipNote = opts?.skipProduct
-    ? '\n\nIMPORTANT: Skip Phases 1, 1.5, 2, and 3 entirely. Only run Phase 0 (CI Health Audit). Return ci_scorecard + ci_findings, with phase_1_2_3_findings as an empty array.\n'
+    ? '\n\nIMPORTANT: Skip Phases 1, 2, and 3 entirely. Only run Phase 0 (CI Health Audit). Return ci_scorecard + ci_findings, with phase_1_2_3_findings as an empty array.\n'
     : '';
 
   // Cap CI files in prompt to keep size manageable. Each file already
@@ -697,13 +647,6 @@ function buildAnalysisPrompt(
   const ciFilesNote = ciRaw.configFiles.length > MAX_CI_FILES_IN_PROMPT
     ? `\n(Note: ${ciRaw.configFiles.length - MAX_CI_FILES_IN_PROMPT} additional CI files exist but were omitted from the prompt for size. Their paths: ${ciRaw.configFiles.slice(MAX_CI_FILES_IN_PROMPT).map(f => f.path).join(', ')})`
     : '';
-
-  const hotModulesBlock = hotModules.length > 0
-    ? `HOT_MODULES (${hotModules.length} files Phase 1.5 MUST deep-inspect):
-${JSON.stringify(hotModules, null, 2)}`
-    : `HOT_MODULES: []
-(no machine signals available — Phase 1.5 has nothing to deep-dive,
-proceed directly from Phase 1 to Phase 2.)`;
 
   return `${ANALYSIS_PROMPT_INSTRUCTIONS}${skipNote}
 
@@ -716,72 +659,42 @@ ${JSON.stringify(profile, null, 2)}
 
 CI_CONFIG_FILES (${ciRaw.configFiles.length} files, primary provider: ${ciRaw.provider}):
 ${JSON.stringify(ciFilesForPrompt, null, 2)}${ciFilesNote}
-
-${hotModulesBlock}
 `;
 }
 
 /**
- * Clone a public or private GitHub repo with enough history to compute
- * 30-day change frequency for the hot-module detector.
+ * Clone a public or private GitHub repo at depth 1.
  *
- * Strategy (in order of preference):
- *   1. --shallow-since="30 days ago" — clone exactly the last 30 days
- *      of commits, regardless of activity level. Active repos get more,
- *      dead repos get less. This is what we actually want.
- *   2. --depth=100 — fallback when shallow-since fails (some git servers
- *      don't support it; happens rarely on github but sometimes on
- *      mirrors). 100 commits is enough for slow-to-moderate repos.
- *   3. --depth=1 — last resort. Hot-module detection degrades to "no
- *      change frequency available" but everything else still works.
+ * If GITHUB_TOKEN is set, authenticate via `git -c http.extraheader=...`
+ * with HTTP Basic auth (`x-access-token:<TOKEN>` base64-encoded). This
+ * is the form git's smart-HTTP protocol actually accepts — Bearer / token
+ * headers work for the GitHub REST API but git-upload-pack will silently
+ * fall back to interactive credential prompt and time out.
  *
- * Auth: GITHUB_TOKEN via Basic header (git smart-HTTP requires Basic,
- * not Bearer; the token never enters URL or git config).
+ * The token never goes into the URL, the shell, or git config — only
+ * into the spawn argv, visible only to root / same-uid processes.
  *
  * Throws on clone failure. Caller's outer try/catch handles cleanup.
  */
 function cloneRepoWithToken(fullName: string, dest: string): void {
   const url = `https://github.com/${fullName}.git`;
-
-  const baseArgs: string[] = [];
+  const args: string[] = [];
   const token = process.env.GITHUB_TOKEN;
   if (token) {
     const basic = Buffer.from(`x-access-token:${token}`).toString('base64');
-    baseArgs.push('-c', `http.extraheader=Authorization: Basic ${basic}`);
+    args.push('-c', `http.extraheader=Authorization: Basic ${basic}`);
   }
+  args.push('clone', '--depth', '1', url, dest);
 
-  const tryClone = (depthArgs: string[]): { ok: boolean; stderr: string } => {
-    const args = [...baseArgs, 'clone', ...depthArgs, url, dest];
-    const r = spawnSync('git', args, {
-      timeout: 60_000,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    if (r.error) return { ok: false, stderr: r.error.message };
-    if (r.status !== 0) {
-      return { ok: false, stderr: (r.stderr?.toString() || '').slice(0, 500) };
-    }
-    return { ok: true, stderr: '' };
-  };
-
-  // Attempt 1: shallow-since 30 days
-  let r = tryClone(['--shallow-since=30 days ago']);
-  if (r.ok) return;
-  console.log(`[edward] shallow-since clone failed, trying depth=100: ${r.stderr.slice(0, 120)}`);
-
-  // Clean up any partial clone before retrying
-  try { execSync(`rm -rf ${dest}`, { stdio: 'pipe' }); } catch {}
-
-  // Attempt 2: depth 100
-  r = tryClone(['--depth', '100']);
-  if (r.ok) return;
-  console.log(`[edward] depth=100 clone failed, falling back to depth=1: ${r.stderr.slice(0, 120)}`);
-
-  try { execSync(`rm -rf ${dest}`, { stdio: 'pipe' }); } catch {}
-
-  // Attempt 3: depth 1 (original behavior; hot-module detection will degrade)
-  r = tryClone(['--depth', '1']);
-  if (r.ok) return;
-  throw new Error(`git clone failed all 3 attempts. Last error: ${r.stderr}`);
+  const result = spawnSync('git', args, {
+    timeout: 60_000,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    const stderr = (result.stderr?.toString() || '').slice(0, 500);
+    throw new Error(`git clone failed (exit ${result.status}): ${stderr}`);
+  }
 }
 
 /**
@@ -879,20 +792,14 @@ async function analyzeRepoWithAgent(
     // into process listings, error messages, and git config.
     cloneRepoWithToken(fullName, `${tmpDir}/repo`);
 
-    // Layer 1 + 2 + 3: profile, CI extraction, and hot-module detection
+    // Layer 1 + 2: profile and CI extraction
     const profile = detectRepoProfile(`${tmpDir}/repo`);
     const ciRaw = extractCIRawConfig(`${tmpDir}/repo`);
-    const hotModules = detectHotModules(`${tmpDir}/repo`, { topN: 8 });
     console.log(`[edward] profile: roles=[${profile.roles.join(',')}] stacks=[${profile.stacks.join(',')}] topology=${profile.topology}`);
     console.log(`[edward] ci: provider=${ciRaw.provider} files=${ciRaw.configFiles.length}`);
-    if (hotModules.length > 0) {
-      console.log(`[edward] hot modules: ${hotModules.map(m => `${m.path}(${m.metrics.changeFreq ?? '?'}c)`).join(', ')}`);
-    } else {
-      console.log(`[edward] hot modules: none (no git history or coverage data)`);
-    }
 
     // Build the per-run prompt
-    const prompt = buildAnalysisPrompt(profile, ciRaw, hotModules, opts);
+    const prompt = buildAnalysisPrompt(profile, ciRaw, opts);
 
     // Run claude subprocess
     const env = { ...process.env } as Record<string, string>;
