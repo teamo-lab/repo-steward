@@ -27,6 +27,10 @@
  * `<task>` accepts a UUID prefix (first 8 chars is enough when unambiguous).
  */
 
+import { execSync } from 'node:child_process';
+import { createInterface } from 'node:readline/promises';
+import { resolveClaudeBin, describeAuthEnv } from './server.js';
+
 const DEFAULT_URL = process.env.EDWARD_URL || 'http://localhost:8080';
 
 // ── ANSI helpers ──
@@ -81,15 +85,17 @@ interface ParsedArgs {
   until?: string;
   port?: number;
   help: boolean;
+  yes: boolean;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
-  const out: ParsedArgs = { _: [], json: false, url: DEFAULT_URL, wait: false, help: false };
+  const out: ParsedArgs = { _: [], json: false, url: DEFAULT_URL, wait: false, help: false, yes: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === '--json') out.json = true;
     else if (a === '--wait') out.wait = true;
     else if (a === '--help' || a === '-h') out.help = true;
+    else if (a === '--yes' || a === '-y') out.yes = true;
     else if (a === '--url') { out.url = argv[++i] || DEFAULT_URL; }
     else if (a === '--reason') { out.reason = argv[++i]; }
     else if (a === '--until') { out.until = argv[++i]; }
@@ -174,9 +180,123 @@ function padEnd(s: string, n: number): string {
   return s + ' '.repeat(n - stripped.length);
 }
 
+// ── Preflight helpers (first-run auth check) ──
+
+async function promptYesNo(question: string, defaultNo = true): Promise<boolean> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const hint = defaultNo ? ' [y/N] ' : ' [Y/n] ';
+    const ans = (await rl.question(question + hint)).trim().toLowerCase();
+    if (ans === '') return !defaultNo;
+    return ans === 'y' || ans === 'yes';
+  } finally {
+    rl.close();
+  }
+}
+
+/**
+ * Runs before `edward serve` actually binds to a port.
+ *
+ * Catches the two most common first-run mistakes on a fresh clone:
+ *   1. the `claude` CLI isn't installed / not on PATH
+ *   2. a stray ANTHROPIC_API_KEY in the shell rc silently takes over
+ *      from the user's OAuth login without them realizing.
+ *
+ * Returns `true` on success (or user-confirmed proceed), `false` on
+ * abort. Prints all output inline — caller decides the exit code.
+ */
+async function preflightAuth(args: ParsedArgs): Promise<boolean> {
+  // Resolve binary
+  let binPath: string;
+  try {
+    binPath = resolveClaudeBin();
+  } catch (err: any) {
+    console.error(`${c.red}error:${c.reset} ${err.message}`);
+    return false;
+  }
+  console.log(`${c.dim}claude binary:${c.reset} ${binPath}`);
+
+  // Describe auth source
+  const env = describeAuthEnv();
+  if (env.apiKeySet) {
+    console.log(
+      `${c.yellow}⚠${c.reset}  ANTHROPIC_API_KEY detected ${c.dim}(${env.apiKeyPreview})${c.reset}`
+    );
+    for (const line of env.suggestion.split('\n')) {
+      console.log(`   ${c.dim}${line}${c.reset}`);
+    }
+
+    if (args.yes || !process.stdin.isTTY) {
+      console.log(`   ${c.dim}(proceeding — --yes or non-TTY)${c.reset}`);
+      return true;
+    }
+    const go = await promptYesNo('\nContinue with API key billing?', true);
+    if (!go) {
+      console.log(`\n${c.bold}Aborted.${c.reset} To use OAuth instead:`);
+      console.log(`  ${c.bold}unset ANTHROPIC_API_KEY${c.reset}`);
+      console.log(`  ${c.bold}edward serve${c.reset}`);
+      return false;
+    }
+  } else {
+    console.log(`${c.green}✓${c.reset}  OAuth login will be used (no ANTHROPIC_API_KEY set)`);
+  }
+  return true;
+}
+
+async function cmdDoctor(_args: ParsedArgs): Promise<void> {
+  console.log(`${c.bold}edward doctor${c.reset}  ${c.dim}— preflight check${c.reset}\n`);
+
+  // Binary
+  let binPath: string;
+  try {
+    binPath = resolveClaudeBin();
+    console.log(`${c.green}✓${c.reset}  claude binary: ${c.bold}${binPath}${c.reset}`);
+  } catch (err: any) {
+    console.log(`${c.red}✗${c.reset}  claude binary not found`);
+    for (const line of String(err.message).split('\n')) {
+      console.log(`   ${line}`);
+    }
+    process.exit(1);
+  }
+
+  // Version
+  try {
+    const version = execSync(`"${binPath}" --version`, {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5_000,
+    }).toString().trim();
+    if (version) console.log(`   ${c.dim}version: ${version}${c.reset}`);
+  } catch {
+    console.log(`${c.yellow}⚠${c.reset}  could not run \`${binPath} --version\` — binary may be broken`);
+  }
+
+  // Auth
+  console.log();
+  const env = describeAuthEnv();
+  if (env.apiKeySet) {
+    console.log(
+      `${c.yellow}⚠${c.reset}  auth source: ${c.bold}ANTHROPIC_API_KEY${c.reset} ${c.dim}(${env.apiKeyPreview})${c.reset}`
+    );
+  } else {
+    console.log(`${c.green}✓${c.reset}  auth source: ${c.bold}OAuth login (via claude CLI)${c.reset}`);
+  }
+  for (const line of env.suggestion.split('\n')) {
+    console.log(`   ${c.dim}${line}${c.reset}`);
+  }
+
+  console.log();
+  console.log(`Next: ${c.bold}edward serve${c.reset}`);
+}
+
 // ── Commands ──
 
 async function cmdServe(args: ParsedArgs): Promise<void> {
+  // First-run gate: resolve the claude binary and confirm auth source
+  // before binding to a port. Bails early on a fresh clone with a clear
+  // message instead of crashing mid-discovery later.
+  const ok = await preflightAuth(args);
+  if (!ok) process.exit(1);
+
   const { startEdwardServer } = await import('./server.js');
   // Precedence: --port flag > EDWARD_PORT env > default 8080
   const port = args.port || parseInt(process.env.EDWARD_PORT || '8080', 10);
@@ -438,7 +558,8 @@ ${b}USAGE${r}
   edward <command> [args] [flags]
 
 ${b}COMMANDS${r}
-  ${b}serve${r} [--port N]                  Start the dashboard server (default port 8080)
+  ${b}serve${r} [--port N] [--yes]         Start the dashboard server (default port 8080)
+  ${b}doctor${r}                            Preflight: locate claude CLI + check auth source
 
   ${b}repos${r}                            List tracked repos
   ${b}repos add${r} owner/repo             Add a repo (fetches GitHub metadata)
@@ -460,6 +581,7 @@ ${b}FLAGS${r}
   --url URL                        Override EDWARD_URL (default http://localhost:8080)
   --port N, -p N                   Port for 'edward serve' (default 8080)
   --wait                           Block until discovery finishes (for discover)
+  --yes, -y                        Skip interactive confirmation (for serve)
   --reason "..."                   Reason for dismiss
   --until ISO                      ISO timestamp for snooze
 
@@ -474,9 +596,11 @@ ${b}EXAMPLES${r}
   edward tasks teamo-lab/clawschool --json | jq '.[] | select(.risk_level=="high")'
 
 ${b}ENVIRONMENT${r}
-  EDWARD_URL    Server URL for CLI commands (default: http://localhost:8080)
-  EDWARD_PORT   Port for 'edward serve' (default: 8080)
-  CLAUDE_BIN    Path to claude binary (default: /Users/zhangyiming/.local/bin/claude)
+  EDWARD_URL         Server URL for CLI commands (default: http://localhost:8080)
+  EDWARD_PORT        Port for 'edward serve' (default: 8080)
+  CLAUDE_BIN         Override auto-detection of the \`claude\` CLI binary
+  ANTHROPIC_API_KEY  If set, analysis runs bill to that API account instead
+                     of your OAuth login. Edward warns + prompts on serve.
 
 ${d}A repo argument accepts either 'owner/repo' or a UUID prefix.${r}
 ${d}A task argument accepts a UUID prefix (8 chars is usually enough).${r}
@@ -499,6 +623,10 @@ export async function runCli(argv: string[]): Promise<number> {
     switch (cmd) {
       case 'serve':
         await cmdServe(args);
+        return 0;
+
+      case 'doctor':
+        await cmdDoctor(args);
         return 0;
 
       case 'version':
