@@ -8,7 +8,9 @@
 import { readFileSync, existsSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawn, execSync } from 'node:child_process';
+import { spawn, spawnSync, execSync } from 'node:child_process';
+import { detectRepoProfile, type RepoProfile } from './profile.js';
+import { extractCIRawConfig, type CIRawConfig } from './ci_extract.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DASHBOARD_HTML_PATH = join(__dirname, 'dashboard.html');
@@ -208,20 +210,238 @@ async function loadSeedFile(): Promise<void> {
 
 // ── Agent analysis using claude CLI ──
 
-const CLAUDE_BIN = process.env.CLAUDE_BIN || Bun.which('claude') || 'claude';
+// Resolve the `claude` CLI binary path.
+//
+// Precedence:
+//   1. CLAUDE_BIN env var (explicit override)
+//   2. `command -v claude` on the user's PATH
+//   3. Common install locations (homebrew, /usr/local, ~/.local, ~/.bun)
+//
+// Throws a friendly error if none succeed. Callers should catch and
+// surface the message — this is the single most common first-run
+// failure on a fresh clone.
+let cachedClaudeBin: string | null = null;
 
-const ANALYSIS_PROMPT = `You are Repo Steward, a senior product engineer doing a pre-incident review of a real production codebase. Your job is to find PRODUCT-LEVEL risks that a smart human reviewer would care about — not just generic code-health nits.
+export function resolveClaudeBin(): string {
+  if (cachedClaudeBin) return cachedClaudeBin;
+
+  if (process.env.CLAUDE_BIN) {
+    if (!existsSync(process.env.CLAUDE_BIN)) {
+      throw new Error(
+        `CLAUDE_BIN=${process.env.CLAUDE_BIN} is set but that file does not exist.\n` +
+        `       Unset it or point it at a real \`claude\` binary.`
+      );
+    }
+    cachedClaudeBin = process.env.CLAUDE_BIN;
+    return cachedClaudeBin;
+  }
+
+  // `command -v` resolves PATH lookups without sourcing the user's interactive rc files.
+  try {
+    const out = execSync('command -v claude 2>/dev/null', {
+      shell: '/bin/sh',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).toString().trim();
+    if (out && existsSync(out)) {
+      cachedClaudeBin = out;
+      return cachedClaudeBin;
+    }
+  } catch {}
+
+  const home = process.env.HOME || '';
+  const candidates = [
+    '/opt/homebrew/bin/claude',
+    '/usr/local/bin/claude',
+    `${home}/.local/bin/claude`,
+    `${home}/.bun/bin/claude`,
+    `${home}/.npm-global/bin/claude`,
+  ];
+  for (const p of candidates) {
+    if (existsSync(p)) {
+      cachedClaudeBin = p;
+      return cachedClaudeBin;
+    }
+  }
+
+  throw new Error(
+    `Could not find the \`claude\` CLI binary on your PATH.\n` +
+    `       Install it and run \`claude\` once to log in, then retry.\n` +
+    `       Or set CLAUDE_BIN=/full/path/to/claude if it lives somewhere unusual.`
+  );
+}
+
+export interface AuthEnvStatus {
+  apiKeySet: boolean;
+  apiKeyPreview: string | null;
+  suggestion: string;
+}
+
+/**
+ * Describes which auth source the `claude` subprocess will end up using.
+ *
+ * We only inspect ANTHROPIC_API_KEY. OAuth detection lives inside the
+ * `claude` binary itself — Keychain / ~/.claude/.credentials.json paths
+ * are cross-platform hostile and not our business. The one thing a user
+ * can accidentally leave wrong is a stray ANTHROPIC_API_KEY export in
+ * their shell rc file, and that's exactly what this check catches.
+ */
+export function describeAuthEnv(): AuthEnvStatus {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (key) {
+    return {
+      apiKeySet: true,
+      apiKeyPreview: key.slice(0, 12) + '…',
+      suggestion:
+        'ANTHROPIC_API_KEY is set. The `claude` subprocess will bill\n' +
+        'analysis runs to that API account and IGNORE any OAuth login\n' +
+        'you configured. To use your OAuth login instead:\n' +
+        '  unset ANTHROPIC_API_KEY\n' +
+        'then relaunch `edward serve`.',
+    };
+  }
+  return {
+    apiKeySet: false,
+    apiKeyPreview: null,
+    suggestion:
+      'No ANTHROPIC_API_KEY in environment — the `claude` subprocess\n' +
+      'will use its stored OAuth credentials. If you have not logged\n' +
+      'in yet, run `claude` once interactively to complete login.',
+  };
+}
+
+// ── CI Scorecard types ──
+
+export type CIScorecardDimensionKey =
+  | 'presence' | 'triggers' | 'build_stage' | 'test_stage' | 'lint_stage'
+  | 'security_scan' | 'branch_protection' | 'deployment' | 'hygiene' | 'docs';
+
+export interface CIScorecardDimension {
+  score: number;                   // 0-10
+  status: 'pass' | 'partial' | 'fail' | 'unverified' | 'na';
+  evidence: string[];
+  gaps: string[];
+}
+
+export interface CIScorecard {
+  overall_score: number;           // 0-100
+  verdict: 'no_ci' | 'minimal' | 'partial' | 'comprehensive';
+  provider: string;
+  generated_at: string;
+  dimensions: Record<CIScorecardDimensionKey, CIScorecardDimension>;
+  top_fixes: Array<{
+    title: string;
+    effort_min: number;
+    impact: 'high' | 'medium' | 'low';
+    why: string;
+    suggested_change: string;
+  }>;
+}
+
+const ANALYSIS_PROMPT_INSTRUCTIONS = `You are Repo Steward, a senior product engineer doing a pre-incident review of a real production codebase. Your job is to find PRODUCT-LEVEL risks that a smart human reviewer would care about — not just generic code-health nits.
 
 ══════════════════════════════════════
-PHASE 1 — UNDERSTAND THE PRODUCT (mandatory, do this first)
+PHASE 0 — CI HEALTH AUDIT (run BEFORE phases 1-3)
 ══════════════════════════════════════
-Before suggesting anything, you MUST:
+
+You will be given two machine-detected inputs at the bottom of this prompt:
+- REPO_PROFILE: a JSON object describing topology, roles, stacks, package
+  managers, test directories, and detected scripts
+- CI_CONFIG_FILES: an array of {path, provider, content} objects with the
+  raw text of every CI config file found in the repo
+
+Your job in Phase 0:
+
+STEP A — Build the EXPECTED checklist
+Based on REPO_PROFILE, decide what CI checks this kind of repo SHOULD have.
+Examples:
+- Node frontend → install, lint, typecheck, test, build, dep-vuln-scan
+- Python backend with Dockerfile → install, lint, test, container-scan
+- Library → install, test, multi-version matrix, publish dry-run
+- IaC repo → terraform validate, plan dry-run, security policy check
+- Monorepo → per-workspace install/test, optionally affected-only mode
+If REPO_PROFILE.roles is empty, infer from README and directory listing.
+
+STEP B — Extract the ACTUAL CI
+Read every entry in CI_CONFIG_FILES. Map each job/step into one of these
+buckets: install / lint / typecheck / test / build / security_scan /
+deploy / other. Note these quality signals on every job:
+- timeouts set?
+- dependency / build cache configured?
+- pinned action versions (vN vs @main vs sha)?
+- continue-on-error abused on critical steps?
+- triggers (push, pull_request, tag, schedule, workflow_dispatch)
+- matrix coverage when README implies multi-version support
+
+STEP C — DIFF and emit ci_* findings
+Compare EXPECTED vs ACTUAL. For each gap, emit a finding with type:
+- ci_missing: bucket present in EXPECTED but absent in ACTUAL
+- ci_weak: bucket exists but inadequate (e.g., test runs but not gated)
+- ci_fake: workflow exists but doesn't actually verify (e.g., test step
+  is \`echo 'tests pass'\` or \`|| true\` on critical step)
+- ci_governance_gap: missing trigger / missing required check / matrix gap
+- ci_insecure: hardcoded secret, overprivileged permissions, pin to @main,
+  deprecated action, PR workflow with elevated permissions
+
+userImpact for ci_* findings = what production incident this CI gap would
+let through. Be specific.
+
+STEP D — Compute the CIScorecard
+Score these 10 dimensions on a 0-10 scale:
+
+  presence            — any CI exists, valid syntax, matches host platform
+  triggers            — push/pr/tag/schedule/manual coverage is appropriate
+  build_stage         — install + build runs, matrix where appropriate, cached
+  test_stage          — tests run on every PR, gated, coverage tracked
+  lint_stage          — linter + typecheck present and enforcing
+  security_scan       — dependabot/SAST/secret-scan/SBOM coverage
+  branch_protection   — required checks on default branch (mark UNVERIFIED
+                        in this version — we cannot query GitHub API yet)
+  deployment          — CD configured, staged, gated on tests + security
+  hygiene             — pinned versions, timeouts, no continue-on-error abuse
+  docs                — CI badge in README, CONTRIBUTING references CI
+
+For each dimension: status one of pass/partial/fail/unverified/na.
+- Use \`unverified\` for branch_protection in this version
+- Use \`na\` when the dimension does not apply (e.g., deployment for a
+  pure library repo)
+
+Composite score: weighted sum, weights:
+  presence:15, triggers:8, build_stage:12, test_stage:15, lint_stage:8,
+  security_scan:18, branch_protection:10, deployment:5, hygiene:5, docs:4
+Exclude any \`unverified\` or \`na\` dimension from BOTH numerator and
+denominator before normalizing to 0-100.
+
+verdict:
+  - no_ci          if CI_CONFIG_FILES is empty
+  - minimal        if overall_score < 30
+  - partial        if 30 <= overall_score < 70
+  - comprehensive  if overall_score >= 70
+
+top_fixes: pick the 3 highest-impact fixes (effort_min should be
+realistic — adding dependabot.yml is ~2 minutes, adding a CodeQL
+workflow is ~5 minutes, enforcing tsc is ~1 minute).
+
+══════════════════════════════════════
+PHASE 1 — UNDERSTAND THE PRODUCT (mandatory before phases 2-3)
+══════════════════════════════════════
+Before suggesting product bugs, you MUST:
 1. Read README.md / README.* / docs/ to learn what this product actually does
-2. Identify the top 3-5 user-facing features (sign-up, login, payment, upload, deployment, search, etc.)
-3. Find the entry points for those features (HTTP routes, CLI commands, API endpoints, UI handlers)
-4. Trace at least one critical flow end-to-end from user input → response
+2. Identify EVERY user-facing feature you can find — sign-up, login,
+   payment, upload, deployment, search, settings, admin actions,
+   notifications, billing, exports, integrations, etc. Do not pick a
+   top-N subset. Aim for completeness; if you find 12 features list
+   all 12.
+3. Find the entry points for ALL of them (HTTP routes, CLI commands,
+   API endpoints, UI handlers, scheduled jobs, webhooks, queue
+   consumers)
+4. Trace EVERY critical flow you can identify end-to-end from user
+   input → response. A critical flow is anything where a regression
+   would cause a user-visible failure or data integrity issue.
 
-If there is no README, use directory structure + main entry files to infer the product.
+If there is no README, use directory structure + main entry files to
+infer the product. Use route registries (FastAPI APIRouter, Express
+app.use, Next.js pages/api, Go gin.Engine, Rust router::new etc.) to
+build a complete entry-point inventory before moving to Phase 2.
 
 ══════════════════════════════════════
 PHASE 2 — FUNCTIONAL BUG HUNT (priority — most valuable findings)
@@ -273,16 +493,35 @@ RULES
 - BE PROACTIVE: don't follow bug-fix commits as hints. Find issues that haven't broken yet but will.
 - BE CONCRETE: every finding must reference an actual file:line, not "somewhere in the codebase"
 - BE PRODUCT-MINDED: prefer 1 functional bug over 10 code-quality nits
-- BE HONEST: if the codebase is healthy and you can only find nits, return fewer items
-- TARGET: 8-15 findings, with at least 5 being PHASE 2 (functional) findings if any exist
+- BE HONEST: if the codebase is healthy and you genuinely cannot find
+  any high-confidence issue in a category, return zero items for that
+  category. Do not invent or pad.
+- BE EXHAUSTIVE: there is NO upper limit on findings per category.
+  Report every issue you find with confidence ≥ 0.7. If a real
+  codebase has 25 high-confidence functional bugs, return 25. Do not
+  pick a "top N" subset — silently dropping bugs makes Edward
+  non-deterministic across runs and that is the worst possible
+  failure mode for a quality-audit tool.
 - Each task must be specific enough for another coding agent to fix as a small PR
+- All ci_* findings come from Phase 0
+- All phase_1_2_3 findings come from Phases 1-3
 
 ══════════════════════════════════════
-OUTPUT FORMAT (JSON array only, no markdown)
+OUTPUT FORMAT (JSON object only, no markdown fence)
 ══════════════════════════════════════
-[{
-  "type": "functional_bug|flow_break|ux_gap|compat_risk|doc_drift|security_fix|perf_improvement|dead_code|error_handling|test_gap|code_quality",
-  "title": "Short, action-oriented title (e.g. 'Skill installer fails on Windows due to hardcoded /tmp path')",
+Return EXACTLY one JSON object with this top-level shape:
+
+{
+  "ci_scorecard": { ...CIScorecard schema below... },
+  "ci_findings":          [ ...task objects from Phase 0... ],
+  "phase_1_2_3_findings": [ ...task objects from Phases 1-3... ]
+}
+
+Each task object (in either array) follows this schema:
+
+{
+  "type": "<one of the type tokens below>",
+  "title": "Short, action-oriented title",
   "description": "2-4 sentences. Lead with the USER-FACING SYMPTOM, then the cause, then the fix direction.",
   "confidence": 0.0-1.0,
   "riskLevel": "low|medium|high",
@@ -301,33 +540,246 @@ OUTPUT FORMAT (JSON array only, no markdown)
     "steps": ["step 1", "step 2"],
     "successCriteria": ["After fix, X should produce Y instead of Z"]
   }
-}]
+}
 
-Find 8-15 tasks with confidence >= 0.65. Prioritize Phase 2 functional findings.`;
+Allowed type tokens:
+- ci_findings: ci_missing | ci_weak | ci_fake | ci_governance_gap | ci_insecure
+- phase_1_2_3_findings: functional_bug | flow_break | ux_gap | compat_risk | doc_drift | security_fix | perf_improvement | dead_code | error_handling | test_gap | code_quality
 
-async function analyzeRepoWithAgent(fullName: string): Promise<EdwardTask[]> {
+CIScorecard schema:
+
+{
+  "overall_score": 0-100,
+  "verdict": "no_ci|minimal|partial|comprehensive",
+  "provider": "github_actions|gitlab_ci|circleci|jenkins|azure_pipelines|bitbucket_pipelines|drone|none",
+  "generated_at": "<ISO timestamp>",
+  "dimensions": {
+    "presence":          { "score": 0-10, "status": "...", "evidence": [...], "gaps": [...] },
+    "triggers":          { ... },
+    "build_stage":       { ... },
+    "test_stage":        { ... },
+    "lint_stage":        { ... },
+    "security_scan":     { ... },
+    "branch_protection": { ... },
+    "deployment":        { ... },
+    "hygiene":           { ... },
+    "docs":              { ... }
+  },
+  "top_fixes": [
+    { "title": "...", "effort_min": <int>, "impact": "high|medium|low",
+      "why": "...", "suggested_change": "..." }
+  ]
+}
+
+Confidence threshold: only emit findings with confidence >= 0.7.
+There is NO upper bound on the number of findings — emit every
+finding that crosses the threshold. Sort by confidence descending
+within each category, but do not truncate.
+
+Prioritize Phase 0 (CI gaps) and Phase 2 (functional bugs) when
+exploration time is limited, but do not skip categories entirely.
+
+REMINDER: respond with the JSON object only. No prose, no markdown, no code fence.`;
+
+/**
+ * Build the per-run prompt by appending machine-detected facts to the
+ * static instructions. Keeping the static instructions reviewable by
+ * humans is more important than minimizing token count.
+ */
+function buildAnalysisPrompt(
+  profile: RepoProfile,
+  ciRaw: CIRawConfig,
+  opts?: { skipProduct?: boolean }
+): string {
+  const skipNote = opts?.skipProduct
+    ? '\n\nIMPORTANT: Skip Phases 1, 2, and 3 entirely. Only run Phase 0 (CI Health Audit). Return ci_scorecard + ci_findings, with phase_1_2_3_findings as an empty array.\n'
+    : '';
+
+  // Cap CI files in prompt to keep size manageable. Each file already
+  // truncated to 100KB by ci_extract.ts, but on a repo like react with
+  // 24 workflows we still need a top-level cap.
+  const MAX_CI_FILES_IN_PROMPT = 10;
+  const ciFilesForPrompt = ciRaw.configFiles.slice(0, MAX_CI_FILES_IN_PROMPT);
+  const ciFilesNote = ciRaw.configFiles.length > MAX_CI_FILES_IN_PROMPT
+    ? `\n(Note: ${ciRaw.configFiles.length - MAX_CI_FILES_IN_PROMPT} additional CI files exist but were omitted from the prompt for size. Their paths: ${ciRaw.configFiles.slice(MAX_CI_FILES_IN_PROMPT).map(f => f.path).join(', ')})`
+    : '';
+
+  return `${ANALYSIS_PROMPT_INSTRUCTIONS}${skipNote}
+
+═══════════════════════════════════════
+INPUT — repo facts (machine-detected)
+═══════════════════════════════════════
+
+REPO_PROFILE:
+${JSON.stringify(profile, null, 2)}
+
+CI_CONFIG_FILES (${ciRaw.configFiles.length} files, primary provider: ${ciRaw.provider}):
+${JSON.stringify(ciFilesForPrompt, null, 2)}${ciFilesNote}
+`;
+}
+
+/**
+ * Clone a public or private GitHub repo at depth 1.
+ *
+ * If GITHUB_TOKEN is set, authenticate via `git -c http.extraheader=...`
+ * with HTTP Basic auth (`x-access-token:<TOKEN>` base64-encoded). This
+ * is the form git's smart-HTTP protocol actually accepts — Bearer / token
+ * headers work for the GitHub REST API but git-upload-pack will silently
+ * fall back to interactive credential prompt and time out.
+ *
+ * The token never goes into the URL, the shell, or git config — only
+ * into the spawn argv, visible only to root / same-uid processes.
+ *
+ * Throws on clone failure. Caller's outer try/catch handles cleanup.
+ */
+function cloneRepoWithToken(fullName: string, dest: string): void {
+  const url = `https://github.com/${fullName}.git`;
+  const args: string[] = [];
+  const token = process.env.GITHUB_TOKEN;
+  if (token) {
+    const basic = Buffer.from(`x-access-token:${token}`).toString('base64');
+    args.push('-c', `http.extraheader=Authorization: Basic ${basic}`);
+  }
+  args.push('clone', '--depth', '1', url, dest);
+
+  const result = spawnSync('git', args, {
+    timeout: 60_000,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    const stderr = (result.stderr?.toString() || '').slice(0, 500);
+    throw new Error(`git clone failed (exit ${result.status}): ${stderr}`);
+  }
+}
+
+/**
+ * Find the first balanced JSON value (`{...}` or `[...]`) starting at
+ * the first matching opener in `text`. Walks character by character,
+ * tracking string state and escapes so quoted braces / brackets don't
+ * fool the depth counter.
+ *
+ * This replaces the previous regex-based parser, which had two failure
+ * modes:
+ *   1. Non-greedy code-fence regex truncated at the first nested ``` —
+ *      losing every finding when Claude's description embedded a yaml
+ *      example.
+ *   2. Greedy `\{[\s\S]*\}` over-matched into trailing prose containing
+ *      `${{ secrets.X }}` — choking the parser on the trailing garbage.
+ *
+ * Returns null if no balanced value is found.
+ */
+function findFirstBalancedJson(text: string, open: '{' | '['): string | null {
+  const close = open === '{' ? '}' : ']';
+  const startIdx = text.indexOf(open);
+  if (startIdx < 0) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = startIdx; i < text.length; i++) {
+    const ch = text[i];
+    if (escape) { escape = false; continue; }
+    if (inString) {
+      if (ch === '\\') escape = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === open) depth++;
+    else if (ch === close) {
+      depth--;
+      if (depth === 0) return text.slice(startIdx, i + 1);
+    }
+  }
+  return null;
+}
+
+/**
+ * Convert a raw task object from the LLM output into an EdwardTask.
+ * Defensive — every field has a default, never throws on weird shapes.
+ */
+function toEdwardTask(t: any): EdwardTask | null {
+  if (!t || typeof t !== 'object' || !t.title) return null;
+  // Confidence threshold raised from 0.65 to 0.7 to cut the "edge"
+  // findings that flip on/off across runs (the 0.62-0.68 band was the
+  // main source of run-to-run variance).
+  if (typeof t.confidence !== 'number' || t.confidence < 0.7) return null;
+
+  return {
+    id: uuid(),
+    repo_id: '',
+    signal_ids: [],
+    type: t.type || 'code_quality',
+    status: 'suggested',
+    title: String(t.title),
+    description: String(t.description || '') + (t.userImpact ? `\n\n**User impact:** ${t.userImpact}` : ''),
+    evidence: { ...(t.evidence || { signals: [] }), userImpact: t.userImpact },
+    impact: t.impact || { estimatedFiles: [], estimatedLinesChanged: 0, blastRadius: 'isolated' },
+    verification: t.verification || { method: 'Tests pass', steps: [], successCriteria: [] },
+    confidence: Math.min(1, Math.max(0, t.confidence)),
+    risk_level: t.riskLevel || 'low',
+    suggested_at: new Date().toISOString(),
+    approved_at: null,
+    completed_at: null,
+    dismiss_reason: null,
+    snooze_until: null,
+    execution_id: null,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+}
+
+interface AnalyzeResult {
+  tasks: EdwardTask[];
+  scorecard: CIScorecard | null;
+}
+
+async function analyzeRepoWithAgent(
+  fullName: string,
+  opts?: { skipProduct?: boolean }
+): Promise<AnalyzeResult> {
   const tmpDir = `/tmp/edward-${Date.now()}`;
 
   try {
-    // Clone
-    execSync(`git clone --depth 1 https://github.com/${fullName}.git ${tmpDir}/repo`, {
-      timeout: 60_000,
-      stdio: 'pipe',
-    });
+    // Clone — pass GITHUB_TOKEN via http.extraheader so private repos
+    // and rate-limited unauthenticated egress paths actually work.
+    // We deliberately do NOT embed the token in the URL: that leaks it
+    // into process listings, error messages, and git config.
+    cloneRepoWithToken(fullName, `${tmpDir}/repo`);
 
-    // Run Claude analysis
+    // Layer 1 + 2: profile and CI extraction
+    const profile = detectRepoProfile(`${tmpDir}/repo`);
+    const ciRaw = extractCIRawConfig(`${tmpDir}/repo`);
+    console.log(`[edward] profile: roles=[${profile.roles.join(',')}] stacks=[${profile.stacks.join(',')}] topology=${profile.topology}`);
+    console.log(`[edward] ci: provider=${ciRaw.provider} files=${ciRaw.configFiles.length}`);
+
+    // Build the per-run prompt
+    const prompt = buildAnalysisPrompt(profile, ciRaw, opts);
+
+    // Run claude subprocess
     const env = { ...process.env } as Record<string, string>;
     delete env.CLAUDECODE;
     delete env.CLAUDE_CODE_ENTRYPOINT;
 
+    let binPath: string;
+    try {
+      binPath = resolveClaudeBin();
+    } catch (err: any) {
+      console.error(`[edward] ${err.message}`);
+      return { tasks: [], scorecard: null };
+    }
+
     const stdout = await new Promise<string>((resolve, reject) => {
-      const proc = spawn(CLAUDE_BIN, [
-        '-p', ANALYSIS_PROMPT,
+      const proc = spawn(binPath, [
+        '-p', prompt,
         '--output-format', 'json',
         '--dangerously-skip-permissions',
         '--no-session-persistence',
         '--model', 'sonnet',
-        '--max-turns', '40',
+        // 80 turns: prior 40-turn cap was hitting before exploration finished
+        // on real codebases. Budget cap ($5) is the second safety net.
+        '--max-turns', '80',
         '--max-budget-usd', '5',
       ], {
         cwd: `${tmpDir}/repo`,
@@ -346,59 +798,33 @@ async function analyzeRepoWithAgent(fullName: string): Promise<EdwardTask[]> {
     console.log(`[edward] Claude response: cost=$${result.total_cost_usd?.toFixed(2)}, duration=${result.duration_ms}ms, error=${result.is_error}`);
     if (result.is_error || !result.result) {
       console.error(`[edward] Claude error: ${result.result?.slice?.(0, 200)}`);
-      return [];
+      return { tasks: [], scorecard: null };
     }
 
     console.log(`[edward] Raw result preview: ${result.result.slice(0, 300)}...`);
 
-    // Parse tasks from Claude output
-    let parsed: unknown[];
-    try {
-      parsed = JSON.parse(result.result);
-    } catch {
-      // Try extracting from markdown code block
-      const codeMatch = result.result.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
-      if (codeMatch) {
-        try { parsed = JSON.parse(codeMatch[1]); } catch { parsed = []; }
-      } else {
-        const match = result.result.match(/\[[\s\S]*\]/);
-        if (match) {
-          try { parsed = JSON.parse(match[0]); } catch { parsed = []; }
-        } else {
-          console.error(`[edward] Could not parse Claude output as JSON`);
-          return [];
-        }
-      }
+    // Parse — try the new shape first, fall back to the old flat array shape
+    // (kept as a graceful degradation in case Claude regresses to v0.3 format).
+    const parsed = parseAnalysisResult(result.result);
+
+    // Stamp scorecard.generated_at if Claude omitted it
+    if (parsed.scorecard && !parsed.scorecard.generated_at) {
+      parsed.scorecard.generated_at = new Date().toISOString();
+    }
+    // Stamp scorecard.provider if Claude omitted it
+    if (parsed.scorecard && !parsed.scorecard.provider) {
+      parsed.scorecard.provider = ciRaw.provider;
     }
 
-    console.log(`[edward] Parsed ${Array.isArray(parsed) ? parsed.length : 0} raw tasks`);
-    if (!Array.isArray(parsed)) return [];
+    const allRaw = [...parsed.ci_findings, ...parsed.phase_1_2_3_findings];
+    const tasks = allRaw.map(toEdwardTask).filter((t): t is EdwardTask => t !== null);
 
-    return parsed.filter((t: any) => t && t.title && t.confidence >= 0.65).map((t: any) => ({
-      id: uuid(),
-      repo_id: '',
-      signal_ids: [],
-      type: t.type || 'code_quality',
-      status: 'suggested',
-      title: String(t.title),
-      description: String(t.description || '') + (t.userImpact ? `\n\n**User impact:** ${t.userImpact}` : ''),
-      evidence: { ...(t.evidence || { signals: [] }), userImpact: t.userImpact },
-      impact: t.impact || { estimatedFiles: [], estimatedLinesChanged: 0, blastRadius: 'isolated' },
-      verification: t.verification || { method: 'Tests pass', steps: [], successCriteria: [] },
-      confidence: Math.min(1, Math.max(0, t.confidence)),
-      risk_level: t.riskLevel || 'low',
-      suggested_at: new Date().toISOString(),
-      approved_at: null,
-      completed_at: null,
-      dismiss_reason: null,
-      snooze_until: null,
-      execution_id: null,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    }));
+    console.log(`[edward] Parsed ${tasks.length} tasks (${parsed.ci_findings.length} CI + ${parsed.phase_1_2_3_findings.length} product), scorecard=${parsed.scorecard ? 'yes' : 'no'}`);
+
+    return { tasks, scorecard: parsed.scorecard };
   } catch (err: any) {
     console.error(`[edward] Agent analysis failed: ${err.message}`);
-    return [];
+    return { tasks: [], scorecard: null };
   } finally {
     try { execSync(`rm -rf ${tmpDir}`, { stdio: 'pipe' }); } catch {}
   }
@@ -562,6 +988,102 @@ exec "${CLAUDE_BIN}" "$(cat seed.md)"
   return json(result);
 }
 
+interface ParsedAnalysis {
+  ci_findings: any[];
+  phase_1_2_3_findings: any[];
+  scorecard: CIScorecard | null;
+}
+
+/**
+ * Tolerant parser for the LLM analysis output.
+ *
+ * Strategy: try in order, take the first that produces a usable shape:
+ *   1. Direct JSON.parse of the trimmed text
+ *   2. First balanced `{...}` found anywhere in the text (handles
+ *      markdown-wrapped responses + trailing prose + nested code fences
+ *      inside string values)
+ *   3. First balanced `[...]` (legacy v0.3 flat-array shape)
+ *
+ * If everything fails, dump the raw text to /tmp/edward-parse-failure-<ts>.txt
+ * and log the path so the failure is debuggable without re-running the
+ * (expensive) discover. Returns the empty shape on total failure.
+ *
+ * Never throws.
+ */
+function parseAnalysisResult(text: string): ParsedAnalysis {
+  const empty: ParsedAnalysis = { ci_findings: [], phase_1_2_3_findings: [], scorecard: null };
+
+  const tryShape = (parsed: any): ParsedAnalysis | null => {
+    if (!parsed) return null;
+    // New shape: object with at least one of the three expected keys
+    if (typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const ci = Array.isArray(parsed.ci_findings) ? parsed.ci_findings : [];
+      const p123 = Array.isArray(parsed.phase_1_2_3_findings) ? parsed.phase_1_2_3_findings : [];
+      const scorecard: CIScorecard | null = parsed.ci_scorecard && typeof parsed.ci_scorecard === 'object'
+        ? parsed.ci_scorecard
+        : null;
+      if (ci.length > 0 || p123.length > 0 || scorecard) {
+        return { ci_findings: ci, phase_1_2_3_findings: p123, scorecard };
+      }
+      // Object that doesn't match the new shape — give up on this attempt
+      // (don't fall through to "treat as phase_1_2_3" here, the wrong-shape
+      // object would be silently dropped which is exactly the bug we're
+      // fixing).
+      return null;
+    }
+    // Legacy flat array of tasks
+    if (Array.isArray(parsed)) {
+      return { ci_findings: [], phase_1_2_3_findings: parsed, scorecard: null };
+    }
+    return null;
+  };
+
+  // Attempt 1: direct parse
+  try {
+    const parsed = JSON.parse(text.trim());
+    const shaped = tryShape(parsed);
+    if (shaped) return shaped;
+  } catch { /* try next */ }
+
+  // Attempt 2: first balanced {...} object anywhere in the text
+  const objSlice = findFirstBalancedJson(text, '{');
+  if (objSlice) {
+    try {
+      const parsed = JSON.parse(objSlice);
+      const shaped = tryShape(parsed);
+      if (shaped) return shaped;
+    } catch { /* try next */ }
+  }
+
+  // Attempt 3: first balanced [...] array (legacy v0.3 shape)
+  const arrSlice = findFirstBalancedJson(text, '[');
+  if (arrSlice) {
+    try {
+      const parsed = JSON.parse(arrSlice);
+      const shaped = tryShape(parsed);
+      if (shaped) return shaped;
+    } catch { /* fall through */ }
+  }
+
+  // Total failure: dump raw text for offline debugging.
+  // Edward is expensive to re-run ($1+, ~7 min) so silent failures are
+  // very costly. Dumping the raw text means the user can `cat` the
+  // file, see what Claude actually returned, and (in the worst case)
+  // hand-extract findings or rerun with a different prompt — without
+  // burning another scan.
+  try {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const dumpPath = `/tmp/edward-parse-failure-${ts}.txt`;
+    writeFileSync(dumpPath, text, 'utf-8');
+    console.error(`[edward] Could not parse Claude output as the expected shape.`);
+    console.error(`[edward] Raw output dumped to: ${dumpPath}`);
+    console.error(`[edward]   inspect with: cat ${dumpPath}`);
+  } catch (dumpErr: any) {
+    console.error(`[edward] Could not parse Claude output, AND dump failed: ${dumpErr?.message || dumpErr}`);
+  }
+  return empty;
+}
+
 // ── Route handlers ──
 
 async function handleRequest(req: Request): Promise<Response> {
@@ -608,13 +1130,26 @@ async function handleRequest(req: Request): Promise<Response> {
     return repo ? json({ repo }) : json({ error: 'Not found' }, 404);
   }
 
+  // CI scorecard (read from repo.settings, populated by analyzeRepoWithAgent)
+  const scorecardMatch = path.match(/^\/api\/v1\/repos\/([^/]+)\/ci-scorecard$/);
+  if (scorecardMatch && method === 'GET') {
+    const repo = repos.get(scorecardMatch[1]);
+    if (!repo) return json({ error: 'Repo not found' }, 404);
+    return json({
+      scorecard: repo.settings.ci_scorecard ?? null,
+      generated_at: repo.settings.ci_scorecard_at ?? null,
+    });
+  }
+
   // Suggestions
   const suggestMatch = path.match(/^\/api\/v1\/repos\/([^/]+)\/suggestions$/);
   if (suggestMatch && method === 'GET') {
     const repoTasks = [...tasks.values()]
       .filter(t => t.repo_id === suggestMatch[1] && t.status === 'suggested')
       .sort((a, b) => b.confidence - a.confidence)
-      .slice(0, 10);
+      // Slice raised from 10 to 30 to match the expanded SAVE_CAP and
+      // expose long-tail findings in the primary "Suggestions" view.
+      .slice(0, 30);
     return json({
       suggestions: repoTasks.map(task => ({
         task,
@@ -635,6 +1170,7 @@ async function handleRequest(req: Request): Promise<Response> {
   }
 
   // Discover (async — returns immediately, runs analysis in background)
+  // Query param: ?skip_product=1 → only run Phase 0 (CI audit), faster.
   const discoverMatch = path.match(/^\/api\/v1\/repos\/([^/]+)\/discover$/);
   if (discoverMatch && method === 'POST') {
     const repo = repos.get(discoverMatch[1]);
@@ -643,14 +1179,29 @@ async function handleRequest(req: Request): Promise<Response> {
     if (discoveryRunning) return json({ tasks: [], count: 0, message: 'Discovery already running' });
     discoveryRunning = true;
 
+    const skipProduct = url.searchParams.get('skip_product') === '1';
+
     // Run in background — return immediately
     (async () => {
       try {
-        console.log(`[edward] Running agent analysis for ${repo.full_name}...`);
-        const agentTasks = await analyzeRepoWithAgent(repo.full_name);
+        console.log(`[edward] Running agent analysis for ${repo.full_name}${skipProduct ? ' (skip_product)' : ''}...`);
+        const result = await analyzeRepoWithAgent(repo.full_name, { skipProduct });
 
+        // Persist the scorecard onto the repo's settings field (existing
+        // extensible Record<string, unknown>, no schema migration needed).
+        if (result.scorecard) {
+          repo.settings.ci_scorecard = result.scorecard;
+          repo.settings.ci_scorecard_at = new Date().toISOString();
+          repo.updated_at = new Date().toISOString();
+        }
+
+        // Save tasks (with dedupe). Cap raised from 15 to 50 to
+        // accommodate exhaustive scans (no per-category quota anymore;
+        // a real codebase like clawschool with multiple security +
+        // payment + auth issues can produce 25+ findings legitimately).
         let saved = 0;
-        for (const at of agentTasks) {
+        const SAVE_CAP = 50;
+        for (const at of result.tasks) {
           const dup = [...tasks.values()].find(
             t => t.repo_id === repo.id && t.type === at.type && t.title === at.title && !['dismissed', 'merged', 'failed'].includes(t.status)
           );
@@ -659,10 +1210,10 @@ async function handleRequest(req: Request): Promise<Response> {
           at.repo_id = repo.id;
           tasks.set(at.id, at);
           saved++;
-          if (saved >= 10) break;
+          if (saved >= SAVE_CAP) break;
         }
 
-        console.log(`[edward] Discovery complete: ${saved} tasks saved for ${repo.full_name}`);
+        console.log(`[edward] Discovery complete: ${saved} tasks saved, scorecard=${result.scorecard ? `${result.scorecard.overall_score}/100` : 'none'} for ${repo.full_name}`);
       } catch (err: any) {
         console.error(`[edward] Discovery failed: ${err.message}`);
       } finally {
