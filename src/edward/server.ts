@@ -313,6 +313,7 @@ export function describeAuthEnv(): AuthEnvStatus {
 
 export type CIScorecardDimensionKey =
   | 'presence' | 'triggers' | 'build_stage' | 'test_stage' | 'lint_stage'
+  | 'coverage'
   | 'security_scan' | 'branch_protection' | 'deployment' | 'hygiene' | 'docs';
 
 export interface CIScorecardDimension {
@@ -343,11 +344,20 @@ const ANALYSIS_PROMPT_INSTRUCTIONS = `You are Repo Steward, a senior product eng
 PHASE 0 — CI HEALTH AUDIT (run BEFORE phases 1-3)
 ══════════════════════════════════════
 
-You will be given two machine-detected inputs at the bottom of this prompt:
+You will be given three machine-detected inputs at the bottom of this prompt:
 - REPO_PROFILE: a JSON object describing topology, roles, stacks, package
   managers, test directories, and detected scripts
 - CI_CONFIG_FILES: an array of {path, provider, content} objects with the
   raw text of every CI config file found in the repo
+- CI_COVERAGE_SIGNALS: a deterministic scan of workflow files and repo
+  root for coverage tooling, with shape:
+    { detected: boolean,
+      collected: string[],   // in-CI collectors like "pytest --cov", "jest --coverage", "go test -coverprofile"
+      reported: string[],    // external reporters like "codecov/codecov-action", "coverallsapp/github-action"
+      configured: string[] } // project-level config like "codecov.yml", "pyproject.toml[tool.coverage]"
+  Treat CI_COVERAGE_SIGNALS as ground truth; do NOT second-guess it. If
+  it says detected=false, that means Edward's static scan found zero
+  coverage tooling across every CI file and every known config file.
 
 Your job in Phase 0:
 
@@ -386,13 +396,26 @@ userImpact for ci_* findings = what production incident this CI gap would
 let through. Be specific.
 
 STEP D — Compute the CIScorecard
-Score these 10 dimensions on a 0-10 scale:
+Score these 11 dimensions on a 0-10 scale:
 
   presence            — any CI exists, valid syntax, matches host platform
   triggers            — push/pr/tag/schedule/manual coverage is appropriate
   build_stage         — install + build runs, matrix where appropriate, cached
-  test_stage          — tests run on every PR, gated, coverage tracked
+  test_stage          — tests run on every PR, gated, visible failure reporting
   lint_stage          — linter + typecheck present and enforcing
+  coverage            — coverage is collected in CI AND uploaded to a
+                        dashboard / enforced via threshold. Use
+                        CI_COVERAGE_SIGNALS as ground truth for the
+                        "is it collected / reported" part. Score rubric:
+                          10 = collected + reported + threshold enforced (codecov.yml with target)
+                          8  = collected + reported (codecov/coveralls action present)
+                          6  = collected only (pytest --cov etc.) but not uploaded
+                          4  = coverage config file present but no in-CI invocation
+                          2  = coverage mentioned in README/docs only
+                          0  = detected=false with no signal anywhere
+                        Use \`na\` if REPO_PROFILE suggests the repo has
+                        no executable test layer at all (e.g., pure docs,
+                        dotfiles, static assets).
   security_scan       — dependabot/SAST/secret-scan/SBOM coverage
   branch_protection   — required checks on default branch (mark UNVERIFIED
                         in this version — we cannot query GitHub API yet)
@@ -403,11 +426,16 @@ Score these 10 dimensions on a 0-10 scale:
 For each dimension: status one of pass/partial/fail/unverified/na.
 - Use \`unverified\` for branch_protection in this version
 - Use \`na\` when the dimension does not apply (e.g., deployment for a
-  pure library repo)
+  pure library repo, coverage for a pure-docs repo)
 
 Composite score: weighted sum, weights:
-  presence:15, triggers:8, build_stage:12, test_stage:15, lint_stage:8,
-  security_scan:18, branch_protection:10, deployment:5, hygiene:5, docs:4
+  presence:15, triggers:8, build_stage:12, test_stage:10, lint_stage:8,
+  coverage:5, security_scan:18, branch_protection:10, deployment:5,
+  hygiene:5, docs:4
+(Sum = 100. test_stage dropped from 15 to 10 and the released 5 weight
+went to the new coverage dimension — you still need tests to exist, but
+"tests exist with no coverage signal" is worse than "tests exist with
+coverage reported".)
 Exclude any \`unverified\` or \`na\` dimension from BOTH numerator and
 denominator before normalizing to 0-100.
 
@@ -603,6 +631,7 @@ CIScorecard schema:
     "build_stage":       { ... },
     "test_stage":        { ... },
     "lint_stage":        { ... },
+    "coverage":          { ... },
     "security_scan":     { ... },
     "branch_protection": { ... },
     "deployment":        { ... },
@@ -659,6 +688,9 @@ ${JSON.stringify(profile, null, 2)}
 
 CI_CONFIG_FILES (${ciRaw.configFiles.length} files, primary provider: ${ciRaw.provider}):
 ${JSON.stringify(ciFilesForPrompt, null, 2)}${ciFilesNote}
+
+CI_COVERAGE_SIGNALS (ground truth — deterministic static scan):
+${JSON.stringify(ciRaw.coverage, null, 2)}
 `;
 }
 
