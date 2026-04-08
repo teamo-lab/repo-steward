@@ -12,39 +12,11 @@ CLI binary.
 
 ## Install & run
 
-Requires Bun `>=1.1.0` and a working `claude` CLI binary on your PATH
-that is already logged in to your Anthropic account.
-
-**First time on a fresh clone:**
-
-```bash
-# 1. If you haven't already, install the `claude` CLI and run it once
-#    interactively to complete login.
-claude
-
-# 2. Verify Edward can find the binary and see which auth source will
-#    be used.
-./edward doctor
-
-# 3. Start the dashboard.
-./edward serve
-```
-
-By default Edward uses whatever credentials your `claude` CLI already
-has — a personal OAuth login tied to your Anthropic subscription. If
-`ANTHROPIC_API_KEY` is set in your environment, the `claude`
-subprocess will prefer it over OAuth and analysis runs will be billed
-to that API account instead. On `edward serve` startup Edward warns
-about this and asks you to confirm interactively; pass `--yes` to
-skip the prompt in non-interactive contexts.
-
-**Everyday commands:**
+Requires Bun `>=1.1.0` and a working `claude` CLI binary on your PATH.
 
 ```bash
 ./edward serve                    # dashboard on :8080
 ./edward serve --port 8081        # different port
-./edward serve --yes              # skip auth confirmation prompt
-./edward doctor                   # preflight: locate binary + check auth
 
 ./edward repos                    # list tracked repos
 ./edward repos add owner/repo     # verifies against GitHub before adding
