@@ -710,7 +710,7 @@ ${hotModulesBlock}
  *
  * Throws on clone failure. Caller's outer try/catch handles cleanup.
  */
-function cloneRepoWithToken(fullName: string, dest: string): void {
+function cloneRepoWithToken(fullName: string, dest: string, branch?: string): void {
   const url = `https://github.com/${fullName}.git`;
 
   const baseArgs: string[] = [];
@@ -720,8 +720,15 @@ function cloneRepoWithToken(fullName: string, dest: string): void {
     baseArgs.push('-c', `http.extraheader=Authorization: Basic ${basic}`);
   }
 
+  // If caller specified a non-default branch, add `--branch <name>` and
+  // `--single-branch` so we only fetch refs we actually need. If not
+  // specified, git clones the remote HEAD (default branch) as before.
+  const branchArgs: string[] = branch
+    ? ['--branch', branch, '--single-branch']
+    : [];
+
   const tryClone = (depthArgs: string[]): { ok: boolean; stderr: string } => {
-    const args = [...baseArgs, 'clone', ...depthArgs, url, dest];
+    const args = [...baseArgs, 'clone', ...branchArgs, ...depthArgs, url, dest];
     const r = spawnSync('git', args, {
       timeout: 60_000,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -838,7 +845,7 @@ interface AnalyzeResult {
 
 async function analyzeRepoWithAgent(
   fullName: string,
-  opts?: { skipProduct?: boolean; provider?: Provider; allowFallback?: boolean }
+  opts?: { skipProduct?: boolean; provider?: Provider; allowFallback?: boolean; branch?: string }
 ): Promise<AnalyzeResult> {
   const tmpDir = `/tmp/edward-${Date.now()}`;
 
@@ -852,7 +859,10 @@ async function analyzeRepoWithAgent(
     // Clone — pass GITHUB_TOKEN via http.extraheader so private repos
     // and rate-limited unauthenticated egress paths actually work.
     // We deliberately do NOT embed the token in the URL.
-    cloneRepoWithToken(fullName, `${tmpDir}/repo`);
+    cloneRepoWithToken(fullName, `${tmpDir}/repo`, opts?.branch);
+    if (opts?.branch) {
+      console.log(`[edward] cloned branch: ${opts.branch}`);
+    }
 
     // Layer 1 + 2 + 3: profile, CI extraction, and hot-module detection
     const profile = detectRepoProfile(`${tmpDir}/repo`);
@@ -1513,15 +1523,32 @@ async function handleRequest(req: Request): Promise<Response> {
     const skipProduct = url.searchParams.get('skip_product') === '1';
     const noFallback = url.searchParams.get('no_fallback') === '1';
 
+    // Optional ?branch=<name> to scan a non-default branch. Validated
+    // against a conservative ref-name regex so we don't shell-inject
+    // into `git clone --branch`. Matches common branch/tag naming
+    // without being overly strict — allows foo/bar, feature-123,
+    // v1.2.3, release.2026-04-08.
+    const branchParam = url.searchParams.get('branch');
+    let branch: string | undefined;
+    if (branchParam !== null && branchParam !== '') {
+      if (!/^[A-Za-z0-9._/\-]{1,200}$/.test(branchParam) ||
+          branchParam.startsWith('-') ||
+          branchParam.includes('..')) {
+        return json({ error: `Invalid branch '${branchParam}'. Only [A-Za-z0-9._/-] allowed, no leading '-', no '..'` }, 400);
+      }
+      branch = branchParam;
+    }
+
     // Run in background — return immediately
     (async () => {
       try {
         const logOpts = [
           skipProduct ? 'skip_product' : null,
           provider ? `provider=${provider}` : null,
+          branch ? `branch=${branch}` : null,
         ].filter(Boolean).join(', ');
         console.log(`[edward] Running agent analysis for ${repo.full_name}${logOpts ? ` (${logOpts})` : ''}...`);
-        const result = await analyzeRepoWithAgent(repo.full_name, { skipProduct, provider, allowFallback: !noFallback });
+        const result = await analyzeRepoWithAgent(repo.full_name, { skipProduct, provider, allowFallback: !noFallback, branch });
 
         // Stamp "discovery ran" regardless of outcome so the dashboard can
         // distinguish "never ran" vs "ran but no scorecard returned" (CR #4).
