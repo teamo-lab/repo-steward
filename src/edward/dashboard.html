@@ -69,6 +69,9 @@
   .badge.functional_bug, .badge.flow_break { background: rgba(248,81,73,0.25); color: #ff6b6b; border: 1px solid rgba(248,81,73,0.5); }
   .badge.ux_gap { background: rgba(210,153,34,0.25); color: var(--yellow); border: 1px solid rgba(210,153,34,0.5); }
   .badge.compat_risk { background: rgba(255,107,53,0.25); color: #ff8a3d; border: 1px solid rgba(255,107,53,0.5); }
+  /* CI audit task types (Sprint 1) */
+  .badge.ci_missing, .badge.ci_fake, .badge.ci_insecure { background: rgba(248,81,73,0.25); color: #ff6b6b; border: 1px solid rgba(248,81,73,0.5); }
+  .badge.ci_weak, .badge.ci_governance_gap { background: rgba(210,153,34,0.25); color: var(--yellow); border: 1px solid rgba(210,153,34,0.5); }
   .badge.low { background: rgba(63,185,80,0.15); color: var(--green); }
   .badge.medium { background: rgba(210,153,34,0.15); color: var(--yellow); }
   .badge.high { background: rgba(248,81,73,0.15); color: var(--red); }
@@ -130,10 +133,59 @@
     display: inline-block; vertical-align: middle; margin-left: 6px; }
   .conf-fill { height: 100%; border-radius: 3px; }
 
+  /* CI Health card */
+  .ci-health-card { background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 24px; margin-bottom: 32px; }
+  .ci-health-header { display: flex; align-items: baseline; justify-content: space-between;
+    margin-bottom: 20px; flex-wrap: wrap; gap: 12px; }
+  .ci-health-header h2 { font-size: 18px; font-weight: 600; }
+  .ci-health-score { display: flex; align-items: baseline; gap: 12px; }
+  .ci-health-score .num { font-size: 36px; font-weight: 700; }
+  .ci-health-score .num.green { color: var(--green); }
+  .ci-health-score .num.yellow { color: var(--yellow); }
+  .ci-health-score .num.red { color: var(--red); }
+  .ci-health-score .verdict { font-size: 14px; padding: 4px 12px; border-radius: 12px;
+    background: var(--bg); border: 1px solid var(--border); }
+  .ci-health-score .provider { font-size: 13px; color: var(--text-muted); }
+
+  .dim-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin-bottom: 20px; }
+  .dim-cell { background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px; cursor: pointer; transition: border-color 0.15s; }
+  .dim-cell:hover { border-color: var(--accent); }
+  .dim-cell.pass { border-left: 3px solid var(--green); }
+  .dim-cell.partial { border-left: 3px solid var(--yellow); }
+  .dim-cell.fail { border-left: 3px solid var(--red); }
+  .dim-cell.unverified, .dim-cell.na { border-left: 3px solid var(--text-muted); opacity: 0.6; }
+  .dim-cell .name { font-size: 11px; color: var(--text-muted); text-transform: uppercase;
+    letter-spacing: 0.3px; margin-bottom: 4px; }
+  .dim-cell .score { font-size: 18px; font-weight: 700; }
+  .dim-cell .score.green { color: var(--green); }
+  .dim-cell .score.yellow { color: var(--yellow); }
+  .dim-cell .score.red { color: var(--red); }
+  .dim-cell .score.gray { color: var(--text-muted); }
+
+  .top-fixes { background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 16px; }
+  .top-fixes .label { font-size: 11px; color: var(--text-muted); text-transform: uppercase;
+    margin-bottom: 8px; letter-spacing: 0.3px; }
+  .top-fixes ol { padding-left: 20px; margin: 0; }
+  .top-fixes li { font-size: 14px; margin-bottom: 8px; }
+  .top-fixes li .meta { font-size: 12px; color: var(--text-muted); margin-left: 6px; }
+  .top-fixes li .impact-high { color: var(--red); }
+  .top-fixes li .impact-medium { color: var(--yellow); }
+  .top-fixes li .impact-low { color: var(--text-muted); }
+
+  .ci-empty { text-align: center; padding: 32px 16px; color: var(--text-muted); }
+  .ci-empty .icon { font-size: 36px; margin-bottom: 8px; opacity: 0.4; }
+
   /* Responsive */
   @media (max-width: 768px) {
     .stats { grid-template-columns: repeat(2, 1fr); }
     .task-header { flex-direction: column; gap: 8px; }
+    .dim-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+  @media (max-width: 1024px) and (min-width: 769px) {
+    .dim-grid { grid-template-columns: repeat(5, 1fr); }
   }
 </style>
 </head>
@@ -177,6 +229,15 @@
     <div class="stat-card"><div class="label">Merged</div><div class="value" id="stat-merged">—</div></div>
     <div class="stat-card"><div class="label">DB</div><div class="value green" id="stat-db">—</div></div>
     <div class="stat-card"><div class="label">Redis</div><div class="value green" id="stat-redis">—</div></div>
+  </div>
+
+  <!-- CI Health -->
+  <div id="ci-health-section" class="ci-health-card">
+    <div class="ci-health-header">
+      <h2>CI Health</h2>
+      <div id="ci-health-score" class="ci-health-score"></div>
+    </div>
+    <div id="ci-health-body"></div>
   </div>
 
   <!-- Suggestions -->
@@ -272,7 +333,80 @@ async function loadRepos() {
 async function loadRepo() {
   currentRepo = document.getElementById('repo-select').value;
   if (!currentRepo) return;
-  await Promise.all([loadStats(), loadSuggestions(), loadTasks(), loadExecutions()]);
+  await Promise.all([loadStats(), loadCIScorecard(), loadSuggestions(), loadTasks(), loadExecutions()]);
+}
+
+// ── CI Scorecard ──
+const CI_DIM_KEYS = [
+  'presence', 'triggers', 'build_stage', 'test_stage', 'lint_stage',
+  'security_scan', 'branch_protection', 'deployment', 'hygiene', 'docs'
+];
+
+function scoreColor(score, status) {
+  if (status === 'unverified' || status === 'na') return 'gray';
+  if (score >= 8) return 'green';
+  if (score >= 5) return 'yellow';
+  return 'red';
+}
+
+function overallColor(score) {
+  if (score >= 70) return 'green';
+  if (score >= 30) return 'yellow';
+  return 'red';
+}
+
+async function loadCIScorecard() {
+  if (!currentRepo) return;
+  let data;
+  try {
+    data = await api('/api/v1/repos/' + currentRepo + '/ci-scorecard');
+  } catch {
+    data = { scorecard: null, generated_at: null };
+  }
+  const scoreEl = document.getElementById('ci-health-score');
+  const bodyEl = document.getElementById('ci-health-body');
+  const sc = data.scorecard;
+
+  if (!sc) {
+    scoreEl.innerHTML = '';
+    bodyEl.innerHTML = '<div class="ci-empty"><div class="icon">&#128202;</div>CI scorecard not yet generated.<br>Run <code>edward discover</code> or <code>edward ci-audit</code>.</div>';
+    return;
+  }
+
+  const overallCol = overallColor(sc.overall_score);
+  scoreEl.innerHTML = `
+    <span class="num ${overallCol}">${sc.overall_score}<span style="font-size:18px;color:var(--text-muted);">/100</span></span>
+    <span class="verdict">${esc(sc.verdict)}</span>
+    <span class="provider">${esc(sc.provider || '')}</span>
+  `;
+
+  const dims = sc.dimensions || {};
+  const cellsHtml = CI_DIM_KEYS.map(k => {
+    const d = dims[k];
+    if (!d) {
+      return `<div class="dim-cell na"><div class="name">${k.replace(/_/g,' ')}</div><div class="score gray">—</div></div>`;
+    }
+    const col = scoreColor(d.score, d.status);
+    const statusClass = d.status || 'fail';
+    const scoreText = (d.status === 'unverified' || d.status === 'na') ? '—' : d.score;
+    return `<div class="dim-cell ${statusClass}" title="${esc((d.gaps || []).join(', '))}">
+      <div class="name">${k.replace(/_/g,' ')}</div>
+      <div class="score ${col}">${scoreText}${(d.status==='unverified'||d.status==='na')?'':'<span style="font-size:11px;color:var(--text-muted);">/10</span>'}</div>
+    </div>`;
+  }).join('');
+
+  let fixesHtml = '';
+  if (sc.top_fixes && sc.top_fixes.length > 0) {
+    const items = sc.top_fixes.slice(0, 5).map(f => `
+      <li><strong>${esc(f.title)}</strong>
+        <span class="meta">~${f.effort_min} min · <span class="impact-${f.impact}">${esc(f.impact)} impact</span></span>
+        ${f.why ? '<div style="font-size:12px;color:var(--text-muted);margin-top:2px;">' + esc(f.why) + '</div>' : ''}
+      </li>
+    `).join('');
+    fixesHtml = `<div class="top-fixes"><div class="label">Top fixes</div><ol>${items}</ol></div>`;
+  }
+
+  bodyEl.innerHTML = `<div class="dim-grid">${cellsHtml}</div>${fixesHtml}`;
 }
 
 // ── Stats ──
