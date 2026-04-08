@@ -57,9 +57,6 @@ function colorForType(type: string): string {
   if (['error_handling', 'type_safety'].includes(type)) return c.blue;
   if (['test_gap'].includes(type)) return c.green;
   if (['dead_code', 'code_quality'].includes(type)) return c.magenta;
-  // CI audit types (Sprint 1)
-  if (['ci_missing', 'ci_fake', 'ci_insecure'].includes(type)) return c.red;
-  if (['ci_weak', 'ci_governance_gap'].includes(type)) return c.yellow;
   return c.cyan;
 }
 
@@ -359,118 +356,32 @@ async function cmdReposAdd(args: ParsedArgs): Promise<void> {
   });
 }
 
-// ── CI scorecard helpers ──
-
-interface CIScorecardResponse {
-  scorecard: {
-    overall_score: number;
-    verdict: string;
-    provider: string;
-    generated_at: string;
-    dimensions: Record<string, { score: number; status: string; gaps: string[] }>;
-    top_fixes: Array<{ title: string; effort_min: number; impact: string; why: string }>;
-  } | null;
-  generated_at: string | null;
-}
-
-function colorForCIScore(score: number, status: string): string {
-  if (status === 'unverified' || status === 'na') return c.gray;
-  if (score >= 8) return c.green;
-  if (score >= 5) return c.yellow;
-  return c.red;
-}
-
-function printCIScorecardSummary(sc: CIScorecardResponse['scorecard']): void {
-  if (!sc) {
-    console.log(`${c.dim}CI Health: not generated yet${c.reset}`);
-    return;
-  }
-  const verdictCol =
-    sc.verdict === 'comprehensive' ? c.green :
-    sc.verdict === 'partial' ? c.yellow :
-    c.red;
-  console.log(`${c.bold}CI Health: ${sc.overall_score}/100${c.reset}  ${verdictCol}${sc.verdict}${c.reset}  ${c.dim}(${sc.provider})${c.reset}`);
-
-  // 10 dimensions in two rows of 5 for terminal output
-  const dimKeys = [
-    'presence', 'triggers', 'build_stage', 'test_stage', 'lint_stage',
-    'security_scan', 'branch_protection', 'deployment', 'hygiene', 'docs',
-  ];
-  const cells: string[] = [];
-  for (const key of dimKeys) {
-    const d = sc.dimensions?.[key];
-    if (!d) {
-      cells.push(`${c.gray}${padEnd(key, 12)} -/-${c.reset}`);
-      continue;
-    }
-    const score = typeof d.score === 'number' ? d.score : 0;
-    const col = colorForCIScore(score, d.status);
-    const mark =
-      d.status === 'pass' ? '✓' :
-      d.status === 'partial' ? '⚠' :
-      d.status === 'fail' ? '✗' :
-      '?';
-    // For unverified / na, show "—/—" rather than the meaningless raw 0 score
-    const scoreText = (d.status === 'unverified' || d.status === 'na')
-      ? '  —/—'
-      : `${String(score).padStart(2)}/10`;
-    cells.push(`${col}${mark} ${padEnd(key, 14)} ${scoreText}${c.reset}`);
-  }
-  // Print as two rows of 5
-  for (let i = 0; i < cells.length; i += 5) {
-    console.log('  ' + cells.slice(i, i + 5).join('  '));
-  }
-
-  if (sc.top_fixes && sc.top_fixes.length > 0) {
-    console.log();
-    console.log(`${c.dim}Top fixes:${c.reset}`);
-    for (let i = 0; i < Math.min(sc.top_fixes.length, 3); i++) {
-      const f = sc.top_fixes[i]!;
-      const impactCol = f.impact === 'high' ? c.red : f.impact === 'medium' ? c.yellow : c.gray;
-      console.log(`  ${i + 1}. ${c.bold}${f.title}${c.reset}  ${c.dim}(~${f.effort_min} min, ${impactCol}${f.impact}${c.reset}${c.dim} impact)${c.reset}`);
-    }
-  }
-}
-
-async function fetchScorecard(url: string, repoId: string): Promise<CIScorecardResponse['scorecard']> {
-  try {
-    const data = await api<CIScorecardResponse>(url, `/api/v1/repos/${repoId}/ci-scorecard`);
-    return data.scorecard;
-  } catch {
-    return null;
-  }
-}
-
-// ── Discover / ci-audit shared body ──
-
-async function runDiscoverFlow(args: ParsedArgs, opts: { skipProduct: boolean }): Promise<void> {
+async function cmdDiscover(args: ParsedArgs): Promise<void> {
   const query = args._[1];
-  const verb = opts.skipProduct ? 'ci-audit' : 'discover';
-  if (!query) throw new Error(`Usage: edward ${verb} <owner/repo> [--wait]`);
+  if (!query) throw new Error('Usage: edward discover <owner/repo> [--wait]');
   const repo = await resolveRepo(args.url, query);
 
-  console.log(`${c.dim}Triggering ${verb} for ${repo.full_name}...${c.reset}`);
-  const url = opts.skipProduct
-    ? `/api/v1/repos/${repo.id}/discover?skip_product=1`
-    : `/api/v1/repos/${repo.id}/discover`;
+  console.log(`${c.dim}Triggering discovery for ${repo.full_name}...${c.reset}`);
   const start = await api<{ message: string }>(
     args.url,
-    url,
+    `/api/v1/repos/${repo.id}/discover`,
     { method: 'POST' }
   );
 
   if (!args.wait) {
     console.log(`${c.green}✓${c.reset} ${start.message}`);
-    console.log(`\nPoll status:  ${c.bold}edward ${verb} ${repo.full_name} --wait${c.reset}`);
+    console.log(`\nPoll status:  ${c.bold}edward discover ${repo.full_name} --wait${c.reset}`);
+    console.log(`Or check now: ${c.bold}edward suggestions ${repo.full_name}${c.reset}`);
     return;
   }
 
-  // Wait for completion — poll every 10s, show a spinner
+  // Wait for completion — poll every 15s, show a simple spinner
   const spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
   let frame = 0;
   const t0 = Date.now();
   let lastCount = 0;
 
+  // Spinner tick every 150ms
   const tick = setInterval(() => {
     if (!tty) return;
     const elapsed = Math.floor((Date.now() - t0) / 1000);
@@ -497,24 +408,10 @@ async function runDiscoverFlow(args: ParsedArgs, opts: { skipProduct: boolean })
   }
 
   const elapsed = Math.floor((Date.now() - t0) / 1000);
-  console.log(`${c.green}✓${c.reset} ${verb === 'ci-audit' ? 'CI audit' : 'Discovery'} complete in ${elapsed}s — ${lastCount} tasks`);
+  console.log(`${c.green}✓${c.reset} Discovery complete in ${elapsed}s — ${lastCount} tasks`);
   console.log();
-
-  // Show suggestions (skip if ci-audit and no findings — scorecard already covers it)
+  // Show suggestions immediately
   await cmdSuggestions({ ...args, _: ['suggestions', query] });
-
-  // Append CI scorecard summary (always — printCIScorecardSummary handles null)
-  const sc = await fetchScorecard(args.url, repo.id);
-  console.log();
-  printCIScorecardSummary(sc);
-}
-
-async function cmdDiscover(args: ParsedArgs): Promise<void> {
-  await runDiscoverFlow(args, { skipProduct: false });
-}
-
-async function cmdCiAudit(args: ParsedArgs): Promise<void> {
-  await runDiscoverFlow(args, { skipProduct: true });
 }
 
 async function cmdSuggestions(args: ParsedArgs): Promise<void> {
@@ -668,7 +565,6 @@ ${b}COMMANDS${r}
   ${b}repos add${r} owner/repo             Add a repo (fetches GitHub metadata)
 
   ${b}discover${r} <repo> [--wait]         Trigger agent analysis (async unless --wait)
-  ${b}ci-audit${r} <repo> [--wait]         CI completeness audit only (faster, no product bug scan)
   ${b}suggestions${r} <repo>               Top 10 open suggestions for a repo
   ${b}tasks${r} <repo>                     All tasks (any status)
   ${b}stats${r} <repo>                     Acceptance rate, merge rate, counts
@@ -746,11 +642,6 @@ export async function runCli(argv: string[]): Promise<number> {
 
       case 'discover':
         await cmdDiscover(args);
-        return 0;
-
-      case 'ci-audit':
-      case 'ci_audit':
-        await cmdCiAudit(args);
         return 0;
 
       case 'suggestions':
