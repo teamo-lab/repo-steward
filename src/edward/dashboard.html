@@ -155,6 +155,20 @@
     font-size: 11px; border: 1px solid var(--border); }
   .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
 
+  /* Discovery running banner */
+  .discovery-banner { display: flex; align-items: center; gap: 12px;
+    background: rgba(210,153,34,0.08); border: 1px solid rgba(210,153,34,0.4);
+    border-radius: 10px; padding: 12px 16px; margin-bottom: 24px;
+    font-size: 14px; color: var(--text); }
+  .discovery-banner[hidden] { display: none; }
+  .discovery-banner .spinner { width: 16px; height: 16px; border-radius: 50%;
+    border: 2px solid rgba(210,153,34,0.3); border-top-color: var(--yellow);
+    animation: spin 0.9s linear infinite; flex-shrink: 0; }
+  .discovery-banner .label { color: var(--yellow); font-weight: 600; }
+  .discovery-banner .elapsed { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .btn:disabled { cursor: progress; }
+
   /* Confidence bar */
   .conf-bar { width: 80px; height: 6px; background: var(--border); border-radius: 3px;
     display: inline-block; vertical-align: middle; margin-left: 6px; }
@@ -243,9 +257,19 @@
     <button class="btn" onclick="seedDemo()" style="font-size: 12px;">
       Seed Demo Data
     </button>
-    <button class="btn btn-approve" onclick="runDiscovery()" style="font-size: 12px;">
+    <button id="run-discovery-btn" class="btn btn-approve" onclick="runDiscovery()" style="font-size: 12px;">
       Run Discovery
     </button>
+  </div>
+
+  <!-- Discovery in-progress banner (shown while agent analysis is running) -->
+  <div class="discovery-banner" id="discovery-banner" hidden>
+    <div class="spinner"></div>
+    <span class="label">Discovery running…</span>
+    <span class="elapsed" id="discovery-elapsed"></span>
+    <span style="color: var(--text-muted); margin-left: auto; font-size: 12px;">
+      Agent analysis can take 5–15 min. Tasks will appear here when ready.
+    </span>
   </div>
 
   <!-- Stats -->
@@ -324,6 +348,37 @@ let currentRepo = null;
 // openDiscussModal, consumed by submitDiscussModal, cleared on close.
 let pendingDiscussTaskId = null;
 
+let discoveryStartedAt = null;
+let elapsedTimer = null;
+let activePoll = null;
+
+// Toggle the persistent "discovery running" UI: banner + disabled button + elapsed counter.
+// running=true is idempotent — safe to call multiple times (e.g. on repo switch).
+function setDiscoveryRunning(running) {
+  const banner = document.getElementById('discovery-banner');
+  const btn = document.getElementById('run-discovery-btn');
+  const elapsedEl = document.getElementById('discovery-elapsed');
+
+  if (running) {
+    banner.hidden = false;
+    if (btn) { btn.disabled = true; btn.textContent = 'Discovery running…'; }
+    if (elapsedTimer) clearInterval(elapsedTimer);
+    const tick = () => {
+      if (!discoveryStartedAt) { elapsedEl.textContent = ''; return; }
+      const s = Math.floor((Date.now() - discoveryStartedAt) / 1000);
+      const m = Math.floor(s / 60);
+      elapsedEl.textContent = m > 0 ? `(${m}m ${s % 60}s elapsed)` : `(${s}s elapsed)`;
+    };
+    tick();
+    elapsedTimer = setInterval(tick, 1000);
+  } else {
+    banner.hidden = true;
+    if (btn) { btn.disabled = false; btn.textContent = 'Run Discovery'; }
+    if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
+    discoveryStartedAt = null;
+  }
+}
+
 function toast(msg, ms = 3000) {
   const t = document.getElementById('toast');
   t.textContent = msg;
@@ -384,6 +439,18 @@ async function loadRepo() {
   currentRepo = document.getElementById('repo-select').value;
   if (!currentRepo) return;
   await Promise.all([loadStats(), loadCIScorecard(), loadSuggestions(), loadTasks(), loadExecutions()]);
+  // If a discovery is already running on the server (e.g. user reloaded the page
+  // mid-analysis or switched repos), surface the banner and resume polling so the
+  // dashboard auto-refreshes when it finishes.
+  try {
+    const st = await api('/api/v1/repos/' + currentRepo + '/discover/status');
+    if (st.running) {
+      setDiscoveryRunning(true);
+      pollDiscovery();
+    } else {
+      setDiscoveryRunning(false);
+    }
+  } catch { /* status endpoint optional — ignore */ }
 }
 
 // ── CI Scorecard ──
@@ -731,9 +798,10 @@ async function addRepo() {
     document.getElementById('repo-select').value = repoId;
     currentRepo = repoId;
     toast(data.created ? 'Repo added! Running discovery...' : 'Repo already exists. Running discovery...');
-    const disc = await api('/api/v1/repos/' + repoId + '/discover', { method: 'POST' });
-    toast('Discovery complete: ' + disc.count + ' task(s) found');
     await loadRepo();
+    // Kick off discovery the same way the Run Discovery button does, so the user
+    // sees the persistent banner + elapsed counter instead of a stale "0 tasks" toast.
+    runDiscovery();
   } catch (e) {
     toast('Failed to add repo: ' + e.message);
   }
@@ -741,27 +809,34 @@ async function addRepo() {
 
 async function runDiscovery() {
   if (!currentRepo) return toast('Select a repo first');
+  discoveryStartedAt = Date.now();
+  setDiscoveryRunning(true);
   toast('Running discovery (agent analysis in background)...');
   const data = await api('/api/v1/repos/' + currentRepo + '/discover', { method: 'POST' });
   if (data.message) toast(data.message);
-  // Poll for completion
   pollDiscovery();
 }
 
 function pollDiscovery() {
   if (!currentRepo) return;
-  const poll = setInterval(async () => {
+  // Avoid stacking polls if loadRepo() runs while one is already active.
+  if (activePoll) clearInterval(activePoll);
+  activePoll = setInterval(async () => {
     try {
       const st = await api('/api/v1/repos/' + currentRepo + '/discover/status');
       if (!st.running) {
-        clearInterval(poll);
+        clearInterval(activePoll);
+        activePoll = null;
+        setDiscoveryRunning(false);
         toast('Discovery complete! Refreshing...');
-        loadRepo();
+        loadStats();
+        loadSuggestions();
+        loadTasks();
       }
-    } catch { clearInterval(poll); }
+    } catch { clearInterval(activePoll); activePoll = null; setDiscoveryRunning(false); }
   }, 5000);
-  // Auto-stop polling after 10 min
-  setTimeout(() => clearInterval(poll), 600000);
+  // Auto-stop polling after 25 min (server timeout is 20 min)
+  setTimeout(() => { if (activePoll) { clearInterval(activePoll); activePoll = null; setDiscoveryRunning(false); } }, 1500000);
 }
 
 async function seedDemo() {
