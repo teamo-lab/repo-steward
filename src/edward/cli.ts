@@ -30,6 +30,7 @@
 import { execSync } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
 import { resolveClaudeBin, describeAuthEnv } from './server.js';
+import { describeProviderAuth, type ProviderAuthStatus } from './llm_provider.js';
 
 const DEFAULT_URL = process.env.EDWARD_URL || 'http://localhost:8080';
 
@@ -79,6 +80,10 @@ function colorForStatus(status: string): string {
 }
 
 // ── Arg parsing ──
+
+type Provider = 'claude' | 'codex';
+const VALID_PROVIDERS: Provider[] = ['claude', 'codex'];
+
 interface ParsedArgs {
   _: string[];           // positional
   json: boolean;
@@ -89,6 +94,7 @@ interface ParsedArgs {
   port?: number;
   help: boolean;
   yes: boolean;
+  provider?: Provider;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -103,13 +109,39 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (a === '--reason') { out.reason = argv[++i]; }
     else if (a === '--until') { out.until = argv[++i]; }
     else if (a === '--port' || a === '-p') { out.port = parseInt(argv[++i] || '0', 10); }
+    else if (a === '--provider') { out.provider = parseProvider(argv[++i]); }
     else if (a.startsWith('--url=')) { out.url = a.slice(6); }
     else if (a.startsWith('--reason=')) { out.reason = a.slice(9); }
     else if (a.startsWith('--until=')) { out.until = a.slice(8); }
     else if (a.startsWith('--port=')) { out.port = parseInt(a.slice(7), 10); }
+    else if (a.startsWith('--provider=')) { out.provider = parseProvider(a.slice(11)); }
     else out._.push(a);
   }
   return out;
+}
+
+function parseProvider(value: string | undefined): Provider {
+  if (!value) {
+    throw new Error(`--provider requires a value. Valid: ${VALID_PROVIDERS.join(', ')}`);
+  }
+  if (!(VALID_PROVIDERS as string[]).includes(value)) {
+    throw new Error(`Invalid --provider '${value}'. Valid: ${VALID_PROVIDERS.join(', ')}`);
+  }
+  return value as Provider;
+}
+
+/**
+ * Determine the effective provider for this invocation.
+ * Precedence: --provider flag → EDWARD_PROVIDER env → default 'claude'.
+ * Also reports the source so doctor can show where the choice came from.
+ */
+function resolveEffectiveProvider(args: ParsedArgs): { provider: Provider; source: 'flag' | 'env' | 'default' } {
+  if (args.provider) return { provider: args.provider, source: 'flag' };
+  const envVal = process.env.EDWARD_PROVIDER;
+  if (envVal && (VALID_PROVIDERS as string[]).includes(envVal)) {
+    return { provider: envVal as Provider, source: 'env' };
+  }
+  return { provider: 'claude', source: 'default' };
 }
 
 // ── HTTP client ──
@@ -198,34 +230,73 @@ async function promptYesNo(question: string, defaultNo = true): Promise<boolean>
 }
 
 /**
+ * Render a single provider's section in `edward doctor` output.
+ * Returns true if the provider is fully usable (binary + auth both OK).
+ */
+function renderProviderSection(status: ProviderAuthStatus, active: boolean): boolean {
+  const label = status.provider === 'claude' ? 'Claude' : 'Codex';
+  const marker = active ? `${c.bold}[active]${c.reset}` : `${c.dim}[inactive]${c.reset}`;
+  console.log(`${c.bold}${label}${c.reset}  ${marker}`);
+
+  if (!status.binaryPath) {
+    console.log(`  ${c.red}✗${c.reset} binary not found`);
+    if (status.binaryResolveError) {
+      for (const line of status.binaryResolveError.split('\n')) {
+        console.log(`    ${c.dim}${line}${c.reset}`);
+      }
+    }
+    return false;
+  }
+
+  console.log(`  ${c.green}✓${c.reset} binary:  ${status.binaryPath}`);
+  if (status.version) {
+    console.log(`    ${c.dim}version: ${status.version}${c.reset}`);
+  }
+
+  if (status.apiKeySet) {
+    console.log(
+      `  ${c.yellow}⚠${c.reset} auth:    ${c.bold}${status.apiKeyEnvVar}${c.reset} ` +
+      `${c.dim}(${status.apiKeyPreview})${c.reset} ${c.yellow}— overrides OAuth${c.reset}`
+    );
+  } else if (status.oauthAvailable === 'likely') {
+    console.log(`  ${c.green}✓${c.reset} auth:    OAuth credentials detected`);
+  } else {
+    console.log(`  ${c.red}✗${c.reset} auth:    no OAuth credentials found, no ${status.apiKeyEnvVar}`);
+  }
+  for (const line of status.suggestion.split('\n')) {
+    console.log(`    ${c.dim}${line}${c.reset}`);
+  }
+
+  // Usable = binary resolved AND (OAuth OR API key set)
+  return status.binaryPath !== null && (status.oauthAvailable === 'likely' || status.apiKeySet);
+}
+
+/**
  * Runs before `edward serve` actually binds to a port.
  *
  * Catches the two most common first-run mistakes on a fresh clone:
- *   1. the `claude` CLI isn't installed / not on PATH
- *   2. a stray ANTHROPIC_API_KEY in the shell rc silently takes over
+ *   1. the chosen provider's CLI isn't installed / not on PATH
+ *   2. a stray API key in the shell rc silently takes over
  *      from the user's OAuth login without them realizing.
  *
  * Returns `true` on success (or user-confirmed proceed), `false` on
  * abort. Prints all output inline — caller decides the exit code.
  */
 async function preflightAuth(args: ParsedArgs): Promise<boolean> {
-  // Resolve binary
-  let binPath: string;
-  try {
-    binPath = resolveClaudeBin();
-  } catch (err: any) {
-    console.error(`${c.red}error:${c.reset} ${err.message}`);
+  const { provider } = resolveEffectiveProvider(args);
+  const status = describeProviderAuth(provider);
+
+  if (!status.binaryPath) {
+    console.error(`${c.red}error:${c.reset} ${status.binaryResolveError || `${provider} binary not found`}`);
     return false;
   }
-  console.log(`${c.dim}claude binary:${c.reset} ${binPath}`);
+  console.log(`${c.dim}${provider} binary:${c.reset} ${status.binaryPath}`);
 
-  // Describe auth source
-  const env = describeAuthEnv();
-  if (env.apiKeySet) {
+  if (status.apiKeySet) {
     console.log(
-      `${c.yellow}⚠${c.reset}  ANTHROPIC_API_KEY detected ${c.dim}(${env.apiKeyPreview})${c.reset}`
+      `${c.yellow}⚠${c.reset}  ${status.apiKeyEnvVar} detected ${c.dim}(${status.apiKeyPreview})${c.reset}`
     );
-    for (const line of env.suggestion.split('\n')) {
+    for (const line of status.suggestion.split('\n')) {
       console.log(`   ${c.dim}${line}${c.reset}`);
     }
 
@@ -236,59 +307,60 @@ async function preflightAuth(args: ParsedArgs): Promise<boolean> {
     const go = await promptYesNo('\nContinue with API key billing?', true);
     if (!go) {
       console.log(`\n${c.bold}Aborted.${c.reset} To use OAuth instead:`);
-      console.log(`  ${c.bold}unset ANTHROPIC_API_KEY${c.reset}`);
+      console.log(`  ${c.bold}unset ${status.apiKeyEnvVar}${c.reset}`);
       console.log(`  ${c.bold}edward serve${c.reset}`);
       return false;
     }
+  } else if (status.oauthAvailable === 'likely') {
+    console.log(`${c.green}✓${c.reset}  OAuth login will be used (no ${status.apiKeyEnvVar} set)`);
   } else {
-    console.log(`${c.green}✓${c.reset}  OAuth login will be used (no ANTHROPIC_API_KEY set)`);
+    console.log(`${c.red}✗${c.reset}  No OAuth credentials found and no ${status.apiKeyEnvVar} set.`);
+    for (const line of status.suggestion.split('\n')) {
+      console.log(`   ${c.dim}${line}${c.reset}`);
+    }
+    return false;
   }
   return true;
 }
 
-async function cmdDoctor(_args: ParsedArgs): Promise<void> {
+async function cmdDoctor(args: ParsedArgs): Promise<void> {
   console.log(`${c.bold}edward doctor${c.reset}  ${c.dim}— preflight check${c.reset}\n`);
 
-  // Binary
-  let binPath: string;
-  try {
-    binPath = resolveClaudeBin();
-    console.log(`${c.green}✓${c.reset}  claude binary: ${c.bold}${binPath}${c.reset}`);
-  } catch (err: any) {
-    console.log(`${c.red}✗${c.reset}  claude binary not found`);
-    for (const line of String(err.message).split('\n')) {
-      console.log(`   ${line}`);
-    }
-    process.exit(1);
-  }
+  const { provider: activeProvider, source } = resolveEffectiveProvider(args);
+  const sourceLabel =
+    source === 'flag' ? '--provider flag' :
+    source === 'env'  ? 'EDWARD_PROVIDER env' :
+    'default';
+  console.log(`Active provider: ${c.bold}${activeProvider}${c.reset}  ${c.dim}(from ${sourceLabel})${c.reset}\n`);
 
-  // Version
-  try {
-    const version = execSync(`"${binPath}" --version`, {
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 5_000,
-    }).toString().trim();
-    if (version) console.log(`   ${c.dim}version: ${version}${c.reset}`);
-  } catch {
-    console.log(`${c.yellow}⚠${c.reset}  could not run \`${binPath} --version\` — binary may be broken`);
-  }
+  // Show both providers, marking the active one
+  const claudeStatus = describeProviderAuth('claude');
+  const codexStatus = describeProviderAuth('codex');
 
-  // Auth
+  const claudeUsable = renderProviderSection(claudeStatus, activeProvider === 'claude');
   console.log();
-  const env = describeAuthEnv();
-  if (env.apiKeySet) {
-    console.log(
-      `${c.yellow}⚠${c.reset}  auth source: ${c.bold}ANTHROPIC_API_KEY${c.reset} ${c.dim}(${env.apiKeyPreview})${c.reset}`
-    );
+  const codexUsable = renderProviderSection(codexStatus, activeProvider === 'codex');
+
+  console.log();
+  // Diagnostics
+  const activeUsable = activeProvider === 'claude' ? claudeUsable : codexUsable;
+  if (activeUsable) {
+    console.log(`${c.green}✓${c.reset}  Active provider (${activeProvider}) is ready.`);
   } else {
-    console.log(`${c.green}✓${c.reset}  auth source: ${c.bold}OAuth login (via claude CLI)${c.reset}`);
+    console.log(`${c.red}✗${c.reset}  Active provider (${activeProvider}) is not usable. See above.`);
   }
-  for (const line of env.suggestion.split('\n')) {
-    console.log(`   ${c.dim}${line}${c.reset}`);
+  // Suggest fallback if the other provider is usable
+  const otherProvider = activeProvider === 'claude' ? 'codex' : 'claude';
+  const otherUsable = activeProvider === 'claude' ? codexUsable : claudeUsable;
+  if (!activeUsable && otherUsable) {
+    console.log(
+      `${c.yellow}→${c.reset}  Fallback: ${c.bold}edward serve --provider ${otherProvider}${c.reset}  ` +
+      `${c.dim}(or export EDWARD_PROVIDER=${otherProvider})${c.reset}`
+    );
   }
 
   console.log();
-  console.log(`Next: ${c.bold}edward serve${c.reset}`);
+  console.log(`Next: ${c.bold}edward serve${activeProvider !== 'claude' ? ` --provider ${activeProvider}` : ''}${c.reset}`);
 }
 
 // ── Commands ──
@@ -446,16 +518,23 @@ async function fetchScorecard(url: string, repoId: string): Promise<CIScorecardR
 async function runDiscoverFlow(args: ParsedArgs, opts: { skipProduct: boolean }): Promise<void> {
   const query = args._[1];
   const verb = opts.skipProduct ? 'ci-audit' : 'discover';
-  if (!query) throw new Error(`Usage: edward ${verb} <owner/repo> [--wait]`);
+  if (!query) throw new Error(`Usage: edward ${verb} <owner/repo> [--wait] [--provider claude|codex]`);
   const repo = await resolveRepo(args.url, query);
 
-  console.log(`${c.dim}Triggering ${verb} for ${repo.full_name}...${c.reset}`);
-  const url = opts.skipProduct
-    ? `/api/v1/repos/${repo.id}/discover?skip_product=1`
-    : `/api/v1/repos/${repo.id}/discover`;
+  // Pass through the effective provider via query param so the server
+  // runs the discovery with the right LLM backend.
+  const { provider, source } = resolveEffectiveProvider(args);
+  const providerNote = source === 'default' ? '' : ` ${c.dim}(provider=${provider} from ${source === 'flag' ? '--provider' : 'EDWARD_PROVIDER'})${c.reset}`;
+
+  console.log(`${c.dim}Triggering ${verb} for ${repo.full_name}...${c.reset}${providerNote}`);
+  // Build URL with both skip_product and provider query params.
+  const params = new URLSearchParams();
+  if (opts.skipProduct) params.set('skip_product', '1');
+  params.set('provider', provider);
+  const discoverUrl = `/api/v1/repos/${repo.id}/discover?${params.toString()}`;
   const start = await api<{ message: string }>(
     args.url,
-    url,
+    discoverUrl,
     { method: 'POST' }
   );
 
@@ -661,14 +740,14 @@ ${b}USAGE${r}
   edward <command> [args] [flags]
 
 ${b}COMMANDS${r}
-  ${b}serve${r} [--port N] [--yes]         Start the dashboard server (default port 8080)
-  ${b}doctor${r}                            Preflight: locate claude CLI + check auth source
+  ${b}serve${r} [--port N] [--yes] [--provider]   Start the dashboard server
+  ${b}doctor${r}                                   Preflight: check both claude + codex providers
 
   ${b}repos${r}                            List tracked repos
   ${b}repos add${r} owner/repo             Add a repo (fetches GitHub metadata)
 
-  ${b}discover${r} <repo> [--wait]         Trigger agent analysis (async unless --wait)
-  ${b}ci-audit${r} <repo> [--wait]         CI completeness audit only (faster, no product bug scan)
+  ${b}discover${r} <repo> [--wait] [--provider]   Trigger agent analysis (async unless --wait)
+  ${b}ci-audit${r} <repo> [--wait] [--provider]   CI completeness audit only (faster, no product bug scan)
   ${b}suggestions${r} <repo>               Top 10 open suggestions for a repo
   ${b}tasks${r} <repo>                     All tasks (any status)
   ${b}stats${r} <repo>                     Acceptance rate, merge rate, counts
@@ -686,14 +765,17 @@ ${b}FLAGS${r}
   --port N, -p N                   Port for 'edward serve' (default 8080)
   --wait                           Block until discovery finishes (for discover)
   --yes, -y                        Skip interactive confirmation (for serve)
+  --provider claude|codex          LLM backend to use (default: claude; codex = GPT via ChatGPT OAuth)
   --reason "..."                   Reason for dismiss
   --until ISO                      ISO timestamp for snooze
 
 ${b}EXAMPLES${r}
-  edward serve                      # default port 8080
-  edward serve --port 8081          # custom port
+  edward serve                      # default: claude provider
+  edward serve --provider codex     # use codex (GPT) instead of claude
+  edward doctor                     # check both provider availability
   edward repos add teamo-lab/clawschool
   edward discover teamo-lab/clawschool --wait
+  edward discover teamo-lab/clawschool --wait --provider codex
   edward suggestions teamo-lab/clawschool
   edward approve a1b2c3d4
   edward dismiss a1b2c3d4 --reason "won't fix"
@@ -702,9 +784,11 @@ ${b}EXAMPLES${r}
 ${b}ENVIRONMENT${r}
   EDWARD_URL         Server URL for CLI commands (default: http://localhost:8080)
   EDWARD_PORT        Port for 'edward serve' (default: 8080)
+  EDWARD_PROVIDER    Default LLM provider (claude|codex). Overridden by --provider flag.
   CLAUDE_BIN         Override auto-detection of the \`claude\` CLI binary
-  ANTHROPIC_API_KEY  If set, analysis runs bill to that API account instead
-                     of your OAuth login. Edward warns + prompts on serve.
+  CODEX_BIN          Override auto-detection of the \`codex\` CLI binary
+  ANTHROPIC_API_KEY  If set, claude runs bill to that API account instead of OAuth.
+  OPENAI_API_KEY     If set, codex runs bill to that API account instead of ChatGPT OAuth.
 
 ${d}A repo argument accepts either 'owner/repo' or a UUID prefix.${r}
 ${d}A task argument accepts a UUID prefix (8 chars is usually enough).${r}
