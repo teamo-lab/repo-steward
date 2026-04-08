@@ -12,6 +12,11 @@ import { spawn, spawnSync, execSync } from 'node:child_process';
 import { detectRepoProfile, type RepoProfile } from './profile.js';
 import { extractCIRawConfig, type CIRawConfig } from './ci_extract.js';
 import { detectHotModules, type HotModule } from './hot_modules.js';
+import { detectCommitNarrative, type CommitNarrative } from './commit_narrative.js';
+import {
+  loadRepoMemory, memoryForPrompt, recordDismissal, recordAnswer,
+  type RepoMemory,
+} from './repo_memory.js';
 import { invokeLLMWithFallback, isProvider, type Provider } from './llm_provider.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -70,10 +75,30 @@ interface EdwardExecution {
   created_at: string;
 }
 
+// Async Q&A: the LLM can emit open_questions[] from a scan instead of
+// forcing a guess on a low-confidence finding. Each question is stashed
+// server-side and exposed via GET /api/v1/repos/:id/questions so the
+// repo owner can answer it in their own time from the dashboard. When
+// answered, the answer is written back to per-repo memory and picked up
+// on the next scan via REPO_MEMORY.answeredQuestions.
+interface EdwardQuestion {
+  id: string;
+  repo_id: string;
+  scan_id: string;
+  question: string;
+  why_it_matters: string;
+  what_would_change: string;
+  status: 'open' | 'answered';
+  answer: string | null;
+  asked_at: string;
+  answered_at: string | null;
+}
+
 // State
 const repos: Map<string, EdwardRepo> = new Map();
 const tasks: Map<string, EdwardTask> = new Map();
 const executions: Map<string, EdwardExecution> = new Map();
+const questions: Map<string, EdwardQuestion> = new Map();
 let discoveryRunning = false;
 
 function uuid(): string {
@@ -435,74 +460,84 @@ realistic — adding dependabot.yml is ~2 minutes, adding a CodeQL
 workflow is ~5 minutes, enforcing tsc is ~1 minute).
 
 ══════════════════════════════════════
-PHASE 1 — UNDERSTAND THE PRODUCT (mandatory before phases 2-3)
+PHASE 1 — UNDERSTAND THE PRODUCT AND ITS HISTORY (mandatory before phases 2-3)
 ══════════════════════════════════════
 Before suggesting product bugs, you MUST:
 1. Read README.md / README.* / docs/ to learn what this product actually does
-2. Identify EVERY user-facing feature you can find — sign-up, login,
-   payment, upload, deployment, search, settings, admin actions,
-   notifications, billing, exports, integrations, etc. Do not pick a
-   top-N subset. Aim for completeness; if you find 12 features list
-   all 12.
-3. Find the entry points for ALL of them (HTTP routes, CLI commands,
-   API endpoints, UI handlers, scheduled jobs, webhooks, queue
-   consumers)
-4. Trace EVERY critical flow you can identify end-to-end from user
-   input → response. A critical flow is anything where a regression
-   would cause a user-visible failure or data integrity issue.
+2. Identify the major user-facing features — sign-up, login, payment,
+   upload, deployment, search, settings, admin actions, notifications,
+   billing, exports, integrations, etc. You do not need to list every
+   feature exhaustively — focus on the ones that carry real business
+   or integrity risk if they fail.
+3. Find the entry points for those features (HTTP routes, CLI commands,
+   API endpoints, UI handlers, scheduled jobs, webhooks, queue consumers)
+4. Trace the critical flows end-to-end from user input → response.
+   A critical flow is anything where a regression would cause a
+   user-visible failure or data integrity issue.
+5. Read the COMMIT_NARRATIVE block at the bottom of this prompt. It
+   summarizes what the team has been actively working on in the last
+   year — module trajectories, recurring themes, recent incidents.
+   Use it as context. If recentIncidents shows the team just fixed
+   something in area X, that area is BOTH higher-risk (they hit a
+   bug recently) and lower-priority for new accusations (they are
+   actively refining it, a senior engineer just touched it).
+6. Read the REPO_MEMORY block. It contains previously-dismissed
+   findings with the owner's explanation, and previously-answered
+   questions. Treat the reasons and answers as ground truth about
+   this product's business context and intentional decisions.
 
 If there is no README, use directory structure + main entry files to
-infer the product. Use route registries (FastAPI APIRouter, Express
-app.use, Next.js pages/api, Go gin.Engine, Rust router::new etc.) to
-build a complete entry-point inventory before moving to Phase 2.
+infer the product.
 
 ══════════════════════════════════════
-PHASE 1.5 — MANDATORY HOT-MODULE DEEP-DIVE (run BEFORE Phase 2)
+PHASE 1.5 — HOT-MODULE AND RECENT-INCIDENT DEEP-DIVE (run BEFORE Phase 2)
 ══════════════════════════════════════
 
-You will be given a HOT_MODULES list at the bottom of this prompt
-(possibly empty). Each entry is a file path that machine signals
-(git change frequency, test coverage, complexity) have flagged as
-high-risk for THIS specific repo right now.
+You will be given a HOT_MODULES list and a COMMIT_NARRATIVE block at
+the bottom of this prompt. Hot modules come from machine signals (git
+change frequency, test coverage, complexity). COMMIT_NARRATIVE.incidents
+is the list of commits in the last 90 days whose subjects look like
+"fix", "rollback", "hotfix", "p0", "regression", etc. — the files
+touched by those commits are the team's "we already got burned here"
+breadcrumbs.
 
-For EVERY hot module in the list, you MUST:
+Your Phase 1.5 reading list is the UNION of:
+  - every file in HOT_MODULES
+  - every file listed in COMMIT_NARRATIVE.incidents[].filesTouched
 
-1. Read the entire file (or all relevant sections if it is large).
-2. Trace every public function / endpoint / handler defined in it
-   end-to-end. Follow the data flow into and out of each call.
-3. Specifically check the edge cases that hot modules are most
-   likely to have:
-   - Boundary conditions: scores going DOWN after upgrades, ties,
-     negative values, zero, max-int, off-by-one in pagination.
-   - Idempotency: what happens if this endpoint / callback is
-     called twice with the same input? Lost updates? Double charges?
-     Lost points?
+For each file in that list you MUST:
+
+1. Read the relevant sections of the file end-to-end.
+2. Trace every public function / endpoint / handler defined in it and
+   follow the data flow into and out of each call.
+3. Specifically check:
+   - Boundary conditions: ties, negative values, zero, max-int,
+     off-by-one in pagination.
+   - Idempotency: what if this endpoint / callback is called twice
+     with the same input? Lost updates? Double charges?
    - State machine transitions: can the entity reach a state that
-     wasn't explicitly designed for? Stale "expired" → "pending"?
-     "completed" before "submitted"?
+     was not explicitly designed for?
    - Race conditions: TOCTOU between check and write, missing
      transactions, lost updates under concurrent load.
-   - Auth bypass: does the function check authorization on EVERY
-     entry point? Including the legacy ones?
-   - Input validation: every parameter from outside (HTTP form,
-     query string, JSON body, URL path) — what if it's missing,
-     wrong type, malicious payload, very long, unicode?
+   - Auth / authorization: does the function check authorization on
+     every entry point, including legacy ones?
+   - Input validation: every parameter from outside — missing,
+     wrong type, very long, unicode.
    - Cross-flow leakage: can user A read user B's data through
      this code path?
 
-4. For each issue found, emit a finding in phase_1_2_3_findings
-   with userImpact specifying exactly what the user sees.
+4. For each HIGH-CONFIDENCE issue (see the save gate in the RULES
+   section), emit a finding in phase_1_2_3_findings.
 
-The hot modules list is the single most reliable signal Edward has
-for "where the bugs are most likely to be hiding right now". A
-finding missed in a hot module is a much worse failure than missing
-something in a cold module — it means a real production bug in code
-that everyone has been touching has slipped through anyway.
+IMPORTANT — Phase 1.5 is MANDATORY READING, but not mandatory
+ACCUSATION. Reading a file does not obligate you to emit a finding.
+If a hot module looks fine after the checks above, emit nothing for
+it. If a recent-incident file is now well-tested and the bug has a
+regression test, emit nothing for it. The save gate applies to Phase
+1.5 findings exactly as it applies to Phase 2 findings.
 
-You may NOT skip a hot module because "it looks fine" or "I already
-have enough findings in that area". The list is mandatory and
-exhaustive. After you have completed every hot module, then proceed
-to Phase 2 free exploration of the rest of the codebase.
+After you have completed Phase 1.5, proceed to Phase 2 on the rest of
+the codebase.
 
 ══════════════════════════════════════
 PHASE 2 — FUNCTIONAL BUG HUNT (priority — most valuable findings)
@@ -551,21 +586,62 @@ Skip: style nits, missing type annotations, "could be more idiomatic", missing d
 ══════════════════════════════════════
 RULES
 ══════════════════════════════════════
-- BE PROACTIVE: don't follow bug-fix commits as hints. Find issues that haven't broken yet but will.
-- BE CONCRETE: every finding must reference an actual file:line, not "somewhere in the codebase"
-- BE PRODUCT-MINDED: prefer 1 functional bug over 10 code-quality nits
+- BE CONCRETE: every finding must reference an actual file:line, not "somewhere in the codebase".
+- BE PRODUCT-MINDED: prefer 1 architecture-level risk over 10 code-quality nits.
+- BE CALIBRATED: emit AT MOST 5-8 findings in phase_1_2_3 per scan. Pick
+  the highest-impact candidates. ZERO is a valid answer. If you
+  cannot find something you would bet a month's salary on, return an
+  empty phase_1_2_3_findings array. It is FAR better to return zero
+  findings than to pad with "maybe" suggestions. Quality over
+  quantity — Edward's users dismiss noisy tools.
+- STEELMAN EVERY FINDING before emitting it. For every candidate
+  finding, ask yourself:
+    (a) Why might a senior engineer have written this code on purpose?
+        A single plausible sentence is enough.
+    (b) What did I actually READ to rule that steelman out? Callers?
+        Tests? Config? The layer above that handles retries? The
+        idempotency key at the callback? If you did not read anything,
+        you did not rule out the steelman.
+    (c) Is there a HIGHER-LAYER mitigation that already catches this
+        (rate limiter, idempotency key, transaction boundary, retry
+        with backoff, outbox pattern, DB unique constraint, CDN cache,
+        background reconciliation job)? If yes, the finding should be
+        downgraded or dropped.
+  If the steelman is plausible AND you have not actively ruled it out,
+  DROP the finding or demote it to an open_question. The save-gate
+  fields (why_might_be_intentional / counterevidence_checked /
+  why_no_higher_layer_mitigation) on every finding are MANDATORY.
+- USE REPO_MEMORY: the REPO_MEMORY block at the bottom of this prompt
+  contains findings the repo owner has already dismissed — with their
+  explanation — and questions they have already answered. Before
+  emitting any candidate finding, check whether its type+title matches
+  a dismissed entry, OR its business premise contradicts an answered
+  question. If so, SKIP IT. Do not re-raise a finding the owner has
+  explained away. The memory IS ground truth about this product's
+  business context.
+- USE COMMIT_NARRATIVE: the COMMIT_NARRATIVE block summarizes what
+  the team has been actively working on. Use recurringThemes to learn
+  the domain ("alipay", "refund", "timeout" tell you what the business
+  cares about). Use moduleTrajectories to detect "actively refined"
+  areas — if a module has 30 commits in the last year including
+  multiple feat: and refactor: entries, the team is ON IT, and
+  claiming fundamental bugs in that area without strong counterevidence
+  is almost certainly noise. Use recentIncidents to prioritize Phase
+  1.5 reading.
+- ASK INSTEAD OF GUESS: if a candidate finding depends on business
+  context you CANNOT verify from code alone (e.g. "is it allowed to
+  expose the Alipay user ID in this UI?", "is the 300s timeout on
+  this endpoint intentional?"), emit an open_question instead of a
+  finding. Cap: AT MOST 3 open_questions per scan. Each must be
+  answerable in one sentence by the repo owner. The owner answers
+  async, and the next scan reads the answer from REPO_MEMORY.
 - BE HONEST: if the codebase is healthy and you genuinely cannot find
   any high-confidence issue in a category, return zero items for that
   category. Do not invent or pad.
-- BE EXHAUSTIVE: there is NO upper limit on findings per category.
-  Report every issue you find with confidence ≥ 0.7. If a real
-  codebase has 25 high-confidence functional bugs, return 25. Do not
-  pick a "top N" subset — silently dropping bugs makes Edward
-  non-deterministic across runs and that is the worst possible
-  failure mode for a quality-audit tool.
-- Each task must be specific enough for another coding agent to fix as a small PR
-- All ci_* findings come from Phase 0
-- All phase_1_2_3 findings come from Phases 1-3
+- Each finding must be specific enough for another coding agent to
+  fix as a small PR.
+- All ci_* findings come from Phase 0.
+- All phase_1_2_3 findings come from Phases 1-3.
 
 ══════════════════════════════════════
 OUTPUT FORMAT (JSON object only, no markdown fence)
@@ -574,8 +650,9 @@ Return EXACTLY one JSON object with this top-level shape:
 
 {
   "ci_scorecard": { ...CIScorecard schema below... },
-  "ci_findings":          [ ...task objects from Phase 0... ],
-  "phase_1_2_3_findings": [ ...task objects from Phases 1-3... ]
+  "ci_findings":          [ ...task objects from Phase 0...              ],
+  "phase_1_2_3_findings": [ ...task objects from Phases 1-3, MAX 5-8... ],
+  "open_questions":       [ ...open_question objects, MAX 3...           ]
 }
 
 Each task object (in either array) follows this schema:
@@ -587,6 +664,12 @@ Each task object (in either array) follows this schema:
   "confidence": 0.0-1.0,
   "riskLevel": "low|medium|high",
   "userImpact": "What the user sees when this triggers. Be specific.",
+
+  // SAVE GATE — mandatory, non-empty strings. These force calibration.
+  "why_might_be_intentional": "One sentence. A plausible steelman for why a senior engineer might have written this code on purpose. If you cannot write one, your finding is probably right; write 'no plausible steelman — this is a clear bug' explicitly.",
+  "counterevidence_checked":  "One sentence. What you actually read to rule out the steelman (specific callers, tests, config files, upstream layers). Empty string means you did not check — in that case confidence must be < 0.8.",
+  "why_no_higher_layer_mitigation": "One sentence. Why a layer above this code (retry, idempotency, transaction, rate limiter, DB constraint, reconciliation job) does not already catch the issue.",
+
   "evidence": {
     "signals": ["concrete observation 1", "concrete observation 2"],
     "codeSnippets": [{"file": "path/to/file.py", "line": 42, "content": "actual code line"}]
@@ -603,9 +686,18 @@ Each task object (in either array) follows this schema:
   }
 }
 
+Each open_question object follows this schema:
+
+{
+  "question": "One sentence the owner can answer in one sentence. e.g. 'Is the Alipay user ID allowed to be shown to end users in the payout UI?'",
+  "context":  "One sentence of why this matters to your analysis. e.g. 'I have a candidate finding that treats this as PII exposure, but if it is intentional per compliance, the finding should be dropped.'",
+  "blocks_finding_type": "security_fix",    // optional — which finding type this would unblock if answered
+  "would_emit_without_answer": false          // true if you would rather emit the finding anyway than ask
+}
+
 Allowed type tokens:
 - ci_findings: ci_missing | ci_weak | ci_fake | ci_governance_gap | ci_insecure
-- phase_1_2_3_findings: functional_bug | flow_break | ux_gap | compat_risk | doc_drift | security_fix | perf_improvement | dead_code | error_handling | test_gap | code_quality
+- phase_1_2_3_findings: functional_bug | flow_break | ux_gap | compat_risk | doc_drift | security_fix | perf_improvement | dead_code | error_handling | test_gap | code_quality | architecture_risk
 
 CIScorecard schema:
 
@@ -633,12 +725,16 @@ CIScorecard schema:
 }
 
 Confidence threshold: only emit findings with confidence >= 0.7.
-There is NO upper bound on the number of findings — emit every
-finding that crosses the threshold. Sort by confidence descending
-within each category, but do not truncate.
+Phase 0 (ci_findings) has no count cap — emit every real CI gap you
+find. Phase 1-3 (phase_1_2_3_findings) is capped at 5-8 total. Sort
+by confidence descending within each category. open_questions is
+capped at 3.
 
-Prioritize Phase 0 (CI gaps) and Phase 2 (functional bugs) when
-exploration time is limited, but do not skip categories entirely.
+Prioritize findings the repo owner has NOT already dismissed, that
+survive the save gate, and that touch real user impact. Architecture
+risks (misconfigured timeouts, retry storms, missing circuit breakers,
+broken idempotency at the boundary) are often higher value than local
+code bugs — use the architecture_risk type for those.
 
 REMINDER: respond with the JSON object only. No prose, no markdown, no code fence.`;
 
@@ -651,12 +747,14 @@ function buildAnalysisPrompt(
   profile: RepoProfile,
   ciRaw: CIRawConfig,
   hotModules: HotModule[],
+  commitNarrative: CommitNarrative,
+  repoMemory: RepoMemory,
   opts?: { skipProduct?: boolean; skipCI?: boolean }
 ): string {
   const skipNote = opts?.skipProduct
-    ? '\n\nIMPORTANT: Skip Phases 1, 1.5, 2, and 3 entirely. Only run Phase 0 (CI Health Audit). Return ci_scorecard + ci_findings, with phase_1_2_3_findings as an empty array.\n'
+    ? '\n\nIMPORTANT: Skip Phases 1, 1.5, 2, and 3 entirely. Only run Phase 0 (CI Health Audit). Return ci_scorecard + ci_findings, with phase_1_2_3_findings as an empty array and open_questions as an empty array.\n'
     : opts?.skipCI
-    ? '\n\nIMPORTANT: Skip Phase 0 (CI Health Audit) entirely. Another parallel run is handling CI. Return ci_findings as an empty array and ci_scorecard as null. Focus all turns on Phases 1, 1.5, 2, and 3 (product understanding, hot-module deep-dive, functional bugs).\n'
+    ? '\n\nIMPORTANT: Skip Phase 0 (CI Health Audit) entirely. Another parallel run is handling CI. Return ci_findings as an empty array and ci_scorecard as null. Focus all turns on Phases 1, 1.5, 2, and 3 (product understanding, hot-module deep-dive, calibrated functional bugs).\n'
     : '';
 
   // Cap CI files in prompt to keep size manageable. Each file already
@@ -669,11 +767,41 @@ function buildAnalysisPrompt(
     : '';
 
   const hotModulesBlock = hotModules.length > 0
-    ? `HOT_MODULES (${hotModules.length} files Phase 1.5 MUST deep-inspect):
+    ? `HOT_MODULES (${hotModules.length} files Phase 1.5 reading list):
 ${JSON.stringify(hotModules, null, 2)}`
     : `HOT_MODULES: []
-(no machine signals available — Phase 1.5 has nothing to deep-dive,
-proceed directly from Phase 1 to Phase 2.)`;
+(no machine signals available — Phase 1.5 reading list comes from
+COMMIT_NARRATIVE.incidents only.)`;
+
+  // Commit narrative block. Cap serialized size at 8KB so a noisy repo
+  // can't blow up the prompt. The narrative is strictly advisory.
+  const MAX_NARRATIVE_BYTES = 8 * 1024;
+  let narrativeJson = JSON.stringify(commitNarrative, null, 2);
+  if (narrativeJson.length > MAX_NARRATIVE_BYTES) {
+    // Drop the trajectories tail first (we keep incidents + themes, the
+    // two most opinionated signals).
+    const trimmed: CommitNarrative = {
+      ...commitNarrative,
+      trajectories: commitNarrative.trajectories.slice(0, 10),
+      notes: [...commitNarrative.notes, 'trimmed for prompt size'],
+    };
+    narrativeJson = JSON.stringify(trimmed, null, 2);
+    if (narrativeJson.length > MAX_NARRATIVE_BYTES) {
+      narrativeJson = narrativeJson.slice(0, MAX_NARRATIVE_BYTES) +
+        '\n// ...truncated';
+    }
+  }
+  const commitNarrativeBlock = `COMMIT_NARRATIVE (machine-extracted from git log):
+${narrativeJson}`;
+
+  // Repo memory block. memoryForPrompt already caps at 8KB and drops
+  // oldest entries first if needed.
+  const packed = memoryForPrompt(repoMemory, 8 * 1024);
+  const repoMemoryBlock = (packed.dismissedFindings.length === 0 && packed.answeredQuestions.length === 0)
+    ? `REPO_MEMORY: { "version": 1, "dismissedFindings": [], "answeredQuestions": [] }
+(no prior adjudication from the owner — treat this as a fresh scan.)`
+    : `REPO_MEMORY (owner adjudication from prior scans — treat as ground truth):
+${JSON.stringify(packed, null, 2)}`;
 
   return `${ANALYSIS_PROMPT_INSTRUCTIONS}${skipNote}
 
@@ -688,6 +816,10 @@ CI_CONFIG_FILES (${ciRaw.configFiles.length} files, primary provider: ${ciRaw.pr
 ${JSON.stringify(ciFilesForPrompt, null, 2)}${ciFilesNote}
 
 ${hotModulesBlock}
+
+${commitNarrativeBlock}
+
+${repoMemoryBlock}
 `;
 }
 
@@ -841,6 +973,12 @@ function toEdwardTask(t: any): EdwardTask | null {
 interface AnalyzeResult {
   tasks: EdwardTask[];
   scorecard: CIScorecard | null;
+  open_questions: Array<{
+    question: string;
+    why_it_matters: string;
+    what_would_change: string;
+  }>;
+  scan_id: string;
 }
 
 async function analyzeRepoWithAgent(
@@ -864,10 +1002,18 @@ async function analyzeRepoWithAgent(
       console.log(`[edward] cloned branch: ${opts.branch}`);
     }
 
-    // Layer 1 + 2 + 3: profile, CI extraction, and hot-module detection
+    // Layer 1 + 2 + 3 + 4: profile, CI extraction, hot-module detection,
+    // and commit-narrative detection (git log → trajectories + themes +
+    // incidents). Plus the per-repo memory: prior dismissals and
+    // answered open_questions from past scans.
     const profile = detectRepoProfile(`${tmpDir}/repo`);
     const ciRaw = extractCIRawConfig(`${tmpDir}/repo`);
     const hotModules = detectHotModules(`${tmpDir}/repo`, { topN: 8 });
+    const commitNarrative = detectCommitNarrative(`${tmpDir}/repo`, {
+      hotModulePaths: hotModules.map(h => h.path),
+      windowDays: 365,
+    });
+    const repoMemory = loadRepoMemory(fullName);
     console.log(`[edward] profile: roles=[${profile.roles.join(',')}] stacks=[${profile.stacks.join(',')}] topology=${profile.topology}`);
     console.log(`[edward] ci: provider=${ciRaw.provider} files=${ciRaw.configFiles.length}`);
     if (hotModules.length > 0) {
@@ -875,6 +1021,8 @@ async function analyzeRepoWithAgent(
     } else {
       console.log(`[edward] hot modules: none (no git history or coverage data)`);
     }
+    console.log(`[edward] commit_narrative: ${commitNarrative.trajectories.length} trajectories, ${commitNarrative.themes.length} themes, ${commitNarrative.incidents.length} incidents (window=${commitNarrative.windowDays}d)`);
+    console.log(`[edward] repo_memory: ${repoMemory.dismissedFindings.length} dismissed, ${repoMemory.answeredQuestions.length} answered`);
 
     // Dispatch through the provider abstraction. invokeLLMWithFallback
     // handles binary resolution, spawn, env scrubbing, error capture,
@@ -913,7 +1061,7 @@ async function analyzeRepoWithAgent(
       const phaseOpts = label === 'phase0'
         ? { skipProduct: true }
         : { skipCI: true };
-      const phasePrompt = buildAnalysisPrompt(profile, ciRaw, hotModules, phaseOpts);
+      const phasePrompt = buildAnalysisPrompt(profile, ciRaw, hotModules, commitNarrative, repoMemory, phaseOpts);
       const maxTurns = label === 'phase0' ? 15 : 60;
       const r = await invokeLLMWithFallback(
         phasePrompt,
@@ -946,7 +1094,7 @@ async function analyzeRepoWithAgent(
     const phaseResults = await Promise.all(phases);
 
     let totalCost = 0;
-    let combinedParsed: ParsedAnalysis = { ci_findings: [], phase_1_2_3_findings: [], scorecard: null };
+    let combinedParsed: ParsedAnalysis = { ci_findings: [], phase_1_2_3_findings: [], scorecard: null, open_questions: [] };
     for (const pr of phaseResults) {
       totalCost += pr.costUsd;
       const triedLabel =
@@ -975,10 +1123,13 @@ async function analyzeRepoWithAgent(
       if (phaseParsed.scorecard && !combinedParsed.scorecard) {
         combinedParsed.scorecard = phaseParsed.scorecard;
       }
+      if (phaseParsed.open_questions.length > 0) {
+        combinedParsed.open_questions.push(...phaseParsed.open_questions);
+      }
     }
 
     if (phaseResults.every(p => !p.ok)) {
-      return { tasks: [], scorecard: null };
+      return { tasks: [], scorecard: null, open_questions: [], scan_id: uuid() };
     }
 
     const parsed = combinedParsed;
@@ -1074,12 +1225,29 @@ async function analyzeRepoWithAgent(
       }
     }
 
-    console.log(`[edward] Parsed ${tasks.length} tasks (${parsed.ci_findings.length} CI + ${parsed.phase_1_2_3_findings.length} product), scorecard=${parsed.scorecard ? 'yes' : 'no'}`);
+    // Normalize open_questions: drop anything malformed, cap at 3,
+    // slice strings to sane lengths. This runs in-process so we can
+    // trust the shape when wiring downstream state.
+    const rawOpenQuestions = Array.isArray(parsed.open_questions) ? parsed.open_questions : [];
+    const normalizedOpenQuestions = rawOpenQuestions
+      .filter(q => q && typeof q === 'object' && typeof q.question === 'string' && q.question.trim())
+      .slice(0, 3)
+      .map(q => ({
+        question: String(q.question).slice(0, 500),
+        why_it_matters: String(q.why_it_matters || '').slice(0, 500),
+        what_would_change: String(q.what_would_change || '').slice(0, 500),
+      }));
 
-    return { tasks, scorecard: parsed.scorecard };
+    const scanId = uuid();
+    console.log(
+      `[edward] Parsed ${tasks.length} tasks (${parsed.ci_findings.length} CI + ${parsed.phase_1_2_3_findings.length} product), ` +
+      `scorecard=${parsed.scorecard ? 'yes' : 'no'}, open_questions=${normalizedOpenQuestions.length}`
+    );
+
+    return { tasks, scorecard: parsed.scorecard, open_questions: normalizedOpenQuestions, scan_id: scanId };
   } catch (err: any) {
     console.error(`[edward] Agent analysis failed: ${err.message}`);
-    return { tasks: [], scorecard: null };
+    return { tasks: [], scorecard: null, open_questions: [], scan_id: uuid() };
   } finally {
     try { execSync(`rm -rf ${tmpDir}`, { stdio: 'pipe' }); } catch {}
   }
@@ -1247,6 +1415,7 @@ interface ParsedAnalysis {
   ci_findings: any[];
   phase_1_2_3_findings: any[];
   scorecard: CIScorecard | null;
+  open_questions: any[];
 }
 
 /**
@@ -1293,7 +1462,7 @@ function stripTrailingProseAndParse(text: string): any | null {
 }
 
 function parseAnalysisResult(text: string): ParsedAnalysis {
-  const empty: ParsedAnalysis = { ci_findings: [], phase_1_2_3_findings: [], scorecard: null };
+  const empty: ParsedAnalysis = { ci_findings: [], phase_1_2_3_findings: [], scorecard: null, open_questions: [] };
 
   // Always dump the raw text so post-mortem doesn't require re-running
   // the (expensive) discover. Cheap: it's a few hundred KB at most, and
@@ -1306,24 +1475,26 @@ function parseAnalysisResult(text: string): ParsedAnalysis {
 
   const tryShape = (parsed: any): ParsedAnalysis | null => {
     if (!parsed) return null;
-    // New shape: object with at least one of the three expected keys
+    // New shape: object with at least one of the four expected keys
     if (typeof parsed === 'object' && !Array.isArray(parsed)) {
       const ci = Array.isArray(parsed.ci_findings) ? parsed.ci_findings : [];
       const p123 = Array.isArray(parsed.phase_1_2_3_findings) ? parsed.phase_1_2_3_findings : [];
       const scorecard: CIScorecard | null = parsed.ci_scorecard && typeof parsed.ci_scorecard === 'object'
         ? parsed.ci_scorecard
         : null;
-      // Accept the object if it has ANY of the three expected keys — even if
-      // all three are empty/null. A correct-shape-but-empty result (LLM
+      const oq = Array.isArray(parsed.open_questions) ? parsed.open_questions : [];
+      // Accept the object if it has ANY of the four expected keys — even if
+      // all four are empty/null. A correct-shape-but-empty result (LLM
       // legitimately found nothing) must not be misclassified as a parse
       // failure; that was the CR #2 bug, which combined with CR #1 burned
       // $1+ runs and showed users "0 findings" + a /tmp dump.
       const hasKnownKey =
         'ci_findings' in parsed ||
         'phase_1_2_3_findings' in parsed ||
-        'ci_scorecard' in parsed;
+        'ci_scorecard' in parsed ||
+        'open_questions' in parsed;
       if (hasKnownKey) {
-        return { ci_findings: ci, phase_1_2_3_findings: p123, scorecard };
+        return { ci_findings: ci, phase_1_2_3_findings: p123, scorecard, open_questions: oq };
       }
       // Object lacks every known key — wrong shape, give up on this attempt
       // (don't fall through to "treat as phase_1_2_3" here, a wrong-shape
@@ -1347,7 +1518,7 @@ function parseAnalysisResult(text: string): ParsedAnalysis {
         t => t && typeof t === 'object' && typeof t.title === 'string'
       );
       if (!looksLikeTasks) return null;
-      return { ci_findings: [], phase_1_2_3_findings: parsed, scorecard: null };
+      return { ci_findings: [], phase_1_2_3_findings: parsed, scorecard: null, open_questions: [] };
     }
     return null;
   };
@@ -1580,7 +1751,35 @@ async function handleRequest(req: Request): Promise<Response> {
           if (saved >= SAVE_CAP) break;
         }
 
-        console.log(`[edward] Discovery complete: ${saved} tasks saved, scorecard=${result.scorecard ? `${result.scorecard.overall_score}/100` : 'none'} for ${repo.full_name}`);
+        // Stash open_questions from this scan. Dedupe against already-open
+        // questions on the same repo by question text so a repeat scan
+        // doesn't pile up duplicates.
+        let newQuestions = 0;
+        for (const oq of result.open_questions) {
+          const dup = [...questions.values()].find(
+            q => q.repo_id === repo.id && q.status === 'open' && q.question === oq.question
+          );
+          if (dup) continue;
+          const q: EdwardQuestion = {
+            id: uuid(),
+            repo_id: repo.id,
+            scan_id: result.scan_id,
+            question: oq.question,
+            why_it_matters: oq.why_it_matters,
+            what_would_change: oq.what_would_change,
+            status: 'open',
+            answer: null,
+            asked_at: new Date().toISOString(),
+            answered_at: null,
+          };
+          questions.set(q.id, q);
+          newQuestions++;
+        }
+
+        console.log(
+          `[edward] Discovery complete: ${saved} tasks saved, scorecard=${result.scorecard ? `${result.scorecard.overall_score}/100` : 'none'}, ` +
+          `${newQuestions} new open_questions, for ${repo.full_name}`
+        );
       } catch (err: any) {
         console.error(`[edward] Discovery failed: ${err.message}`);
       } finally {
@@ -1598,6 +1797,53 @@ async function handleRequest(req: Request): Promise<Response> {
       .filter(t => t.repo_id === tasksMatch[1])
       .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
     return json({ tasks: repoTasks, count: repoTasks.length });
+  }
+
+  // Open questions for a repo (async Q&A inbox from calibrated abstention)
+  const questionsListMatch = path.match(/^\/api\/v1\/repos\/([^/]+)\/questions$/);
+  if (questionsListMatch && method === 'GET') {
+    const repo = repos.get(questionsListMatch[1]);
+    if (!repo) return json({ error: 'Repo not found' }, 404);
+    const repoQs = [...questions.values()].filter(q => q.repo_id === repo.id);
+    const open = repoQs
+      .filter(q => q.status === 'open')
+      .sort((a, b) => new Date(b.asked_at).getTime() - new Date(a.asked_at).getTime());
+    const answered = repoQs
+      .filter(q => q.status === 'answered')
+      .sort((a, b) => new Date(b.answered_at || b.asked_at).getTime() - new Date(a.answered_at || a.asked_at).getTime());
+    return json({ open, answered, open_count: open.length, answered_count: answered.length });
+  }
+
+  // Answer a question: writes to in-memory Map + persists to repo memory
+  const answerMatch = path.match(/^\/api\/v1\/repos\/([^/]+)\/questions\/([^/]+)\/answer$/);
+  if (answerMatch && method === 'POST') {
+    const repo = repos.get(answerMatch[1]);
+    if (!repo) return json({ error: 'Repo not found' }, 404);
+    const q = questions.get(answerMatch[2]);
+    if (!q || q.repo_id !== repo.id) return json({ error: 'Question not found' }, 404);
+    let body: { answer?: string };
+    try {
+      body = await req.json() as { answer?: string };
+    } catch {
+      return json({ error: 'Invalid JSON body' }, 400);
+    }
+    const answer = (body.answer || '').trim();
+    if (!answer) return json({ error: 'answer must be a non-empty string' }, 400);
+    if (answer.length > 2000) return json({ error: 'answer too long (max 2000 chars)' }, 400);
+
+    q.status = 'answered';
+    q.answer = answer;
+    q.answered_at = new Date().toISOString();
+
+    // Persist to per-repo memory so the next scan picks this up via
+    // REPO_MEMORY.answeredQuestions. Best-effort; the in-memory update
+    // above is authoritative for the current session.
+    try {
+      recordAnswer(repo.full_name, q.id, q.question, answer, q.scan_id);
+    } catch (err: any) {
+      console.warn(`[edward] recordAnswer failed for ${repo.full_name}: ${err?.message || err}`);
+    }
+    return json({ status: 'answered', question: q });
   }
 
   // Task action
@@ -1621,10 +1867,27 @@ async function handleRequest(req: Request): Promise<Response> {
         task.execution_id = exec.id;
         return json({ status: 'approved', execution: exec });
       }
-      case 'dismiss':
+      case 'dismiss': {
         task.status = 'dismissed';
         task.dismiss_reason = body.reason || 'Dismissed from dashboard';
+        // Also persist to repo memory so the next scan can skip this
+        // finding (the LLM cross-references REPO_MEMORY.dismissedFindings
+        // before emitting). Best-effort: repo may not be in the map
+        // anymore (e.g. manual deletion), in which case we just skip.
+        const dismissRepo = repos.get(task.repo_id);
+        if (dismissRepo) {
+          try {
+            recordDismissal(
+              dismissRepo.full_name,
+              { type: task.type, title: task.title, id: task.id },
+              task.dismiss_reason,
+            );
+          } catch (err: any) {
+            console.warn(`[edward] recordDismissal failed for ${dismissRepo.full_name}: ${err?.message || err}`);
+          }
+        }
         return json({ status: 'dismissed' });
+      }
       case 'snooze':
         task.status = 'snoozed';
         task.snooze_until = body.snoozeUntil || new Date(Date.now() + 86400000).toISOString();
@@ -1680,4 +1943,4 @@ export function startEdwardServer(port = 8080): void {
   loadSeedFile().catch((err) => console.error(`[edward] seed: load crashed: ${err?.message || err}`));
 }
 
-export { repos, tasks, executions };
+export { repos, tasks, executions, questions };

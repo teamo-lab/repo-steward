@@ -17,6 +17,10 @@ sessions/
 # Per CLAUDE.md, only source code ships; feature artifacts stay local.
 .agent-team/
 
+# Outside-voice session handles (e.g. codex consult sessions).
+# Written when Edward itself is being iterated on; never ships.
+.context/
+
 # Real config for the pr-review-notify skill — contains team chat IDs
 # and Feishu open_ids. The example file is committed; the real one
 # stays local so team data never leaks into the public repo.
