@@ -12,7 +12,7 @@ import { spawn, spawnSync, execSync } from 'node:child_process';
 import { detectRepoProfile, type RepoProfile } from './profile.js';
 import { extractCIRawConfig, type CIRawConfig } from './ci_extract.js';
 import { detectHotModules, type HotModule } from './hot_modules.js';
-import { invokeLLM, isProvider, type Provider } from './llm_provider.js';
+import { invokeLLMWithFallback, isProvider, type Provider } from './llm_provider.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DASHBOARD_HTML_PATH = join(__dirname, 'dashboard.html');
@@ -363,6 +363,17 @@ Examples:
 - Monorepo → per-workspace install/test, optionally affected-only mode
 If REPO_PROFILE.roles is empty, infer from README and directory listing.
 
+HARD RULE — no-CI case (CR #5):
+If CI_CONFIG_FILES is empty AND the repo contains ANY executable code
+(REPO_PROFILE.stacks != ['unknown'] OR REPO_PROFILE.roles non-empty OR
+README / Makefile / package.json scripts mention build/test/deploy), you
+MUST emit exactly one ci_missing finding with confidence >= 0.9 and
+riskLevel = 'high', titled "Repository has no CI configuration at all".
+Do NOT skip this even if you cannot confidently derive the full EXPECTED
+checklist — the deterministic code layer will also synthesize this task
+as a safety net, but emitting it from the model enriches the description
+and de-duplicates with the synthetic one by type+title.
+
 STEP B — Extract the ACTUAL CI
 Read every entry in CI_CONFIG_FILES. Map each job/step into one of these
 buckets: install / lint / typecheck / test / build / security_scan /
@@ -640,10 +651,12 @@ function buildAnalysisPrompt(
   profile: RepoProfile,
   ciRaw: CIRawConfig,
   hotModules: HotModule[],
-  opts?: { skipProduct?: boolean }
+  opts?: { skipProduct?: boolean; skipCI?: boolean }
 ): string {
   const skipNote = opts?.skipProduct
     ? '\n\nIMPORTANT: Skip Phases 1, 1.5, 2, and 3 entirely. Only run Phase 0 (CI Health Audit). Return ci_scorecard + ci_findings, with phase_1_2_3_findings as an empty array.\n'
+    : opts?.skipCI
+    ? '\n\nIMPORTANT: Skip Phase 0 (CI Health Audit) entirely. Another parallel run is handling CI. Return ci_findings as an empty array and ci_scorecard as null. Focus all turns on Phases 1, 1.5, 2, and 3 (product understanding, hot-module deep-dive, functional bugs).\n'
     : '';
 
   // Cap CI files in prompt to keep size manageable. Each file already
@@ -697,7 +710,7 @@ ${hotModulesBlock}
  *
  * Throws on clone failure. Caller's outer try/catch handles cleanup.
  */
-function cloneRepoWithToken(fullName: string, dest: string): void {
+function cloneRepoWithToken(fullName: string, dest: string, branch?: string): void {
   const url = `https://github.com/${fullName}.git`;
 
   const baseArgs: string[] = [];
@@ -707,8 +720,15 @@ function cloneRepoWithToken(fullName: string, dest: string): void {
     baseArgs.push('-c', `http.extraheader=Authorization: Basic ${basic}`);
   }
 
+  // If caller specified a non-default branch, add `--branch <name>` and
+  // `--single-branch` so we only fetch refs we actually need. If not
+  // specified, git clones the remote HEAD (default branch) as before.
+  const branchArgs: string[] = branch
+    ? ['--branch', branch, '--single-branch']
+    : [];
+
   const tryClone = (depthArgs: string[]): { ok: boolean; stderr: string } => {
-    const args = [...baseArgs, 'clone', ...depthArgs, url, dest];
+    const args = [...baseArgs, 'clone', ...branchArgs, ...depthArgs, url, dest];
     const r = spawnSync('git', args, {
       timeout: 60_000,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -825,7 +845,7 @@ interface AnalyzeResult {
 
 async function analyzeRepoWithAgent(
   fullName: string,
-  opts?: { skipProduct?: boolean; provider?: Provider }
+  opts?: { skipProduct?: boolean; provider?: Provider; allowFallback?: boolean; branch?: string }
 ): Promise<AnalyzeResult> {
   const tmpDir = `/tmp/edward-${Date.now()}`;
 
@@ -839,7 +859,10 @@ async function analyzeRepoWithAgent(
     // Clone — pass GITHUB_TOKEN via http.extraheader so private repos
     // and rate-limited unauthenticated egress paths actually work.
     // We deliberately do NOT embed the token in the URL.
-    cloneRepoWithToken(fullName, `${tmpDir}/repo`);
+    cloneRepoWithToken(fullName, `${tmpDir}/repo`, opts?.branch);
+    if (opts?.branch) {
+      console.log(`[edward] cloned branch: ${opts.branch}`);
+    }
 
     // Layer 1 + 2 + 3: profile, CI extraction, and hot-module detection
     const profile = detectRepoProfile(`${tmpDir}/repo`);
@@ -853,35 +876,113 @@ async function analyzeRepoWithAgent(
       console.log(`[edward] hot modules: none (no git history or coverage data)`);
     }
 
-    // Build the per-run prompt (Phase 0 CI audit + Phase 1.5 hot modules + Phase 1-3)
-    const prompt = buildAnalysisPrompt(profile, ciRaw, hotModules, opts);
-
-    // Dispatch through the provider abstraction. invokeLLM handles
-    // binary resolution, spawn, env scrubbing, error capture, and
-    // output normalization for both claude and codex.
-    const result = await invokeLLM(prompt, `${tmpDir}/repo`, {
+    // Dispatch through the provider abstraction. invokeLLMWithFallback
+    // handles binary resolution, spawn, env scrubbing, error capture,
+    // output normalization, AND auto-retry on the other provider if
+    // the primary returns a retriable error.
+    const allowFallback =
+      opts?.allowFallback !== false && process.env.EDWARD_NO_FALLBACK !== '1';
+    const baseCfg = {
       provider: effectiveProvider,
       model: effectiveProvider === 'claude' ? 'sonnet' : undefined,
-      maxTurns: 80,            // honored by claude path; ignored by codex
-      maxBudgetUsd: 5,         // honored by claude path; ignored by codex
-      timeoutMs: 1_200_000,    // 20 min hard ceiling for either provider
-    });
+      maxBudgetUsd: 5,
+      timeoutMs: 1_200_000,
+    };
 
-    console.log(
-      `[edward] ${effectiveProvider} response: cost=$${result.costUsd.toFixed(2)}, ` +
-      `duration=${result.durationMs}ms, ok=${result.ok}`
-    );
-    if (!result.ok) {
-      console.error(`[edward] ${effectiveProvider} error: ${result.error?.slice(0, 300) || '(unknown)'}`);
+    // A3 performance fix: split Phase 0 (CI audit, fast, bounded — no
+    // repo file reads needed) and Phase 1-3 (product bug hunt, heavy,
+    // reads many files) into two parallel LLM calls. Wall time becomes
+    // max(phase0, phase123) instead of phase0 + phase123. Phase 0 also
+    // gets a tighter turn cap since it operates entirely on the data
+    // already inlined in the prompt (REPO_PROFILE + CI_CONFIG_FILES).
+    //
+    // Respects the original skipProduct / skipCI opts: if the caller
+    // asked for only one half, we just run that half sequentially.
+    type PhaseResult = {
+      label: 'phase0' | 'phase123';
+      ok: boolean;
+      stdout: string;
+      costUsd: number;
+      durationMs: number;
+      error?: string;
+      actualProvider: Provider;
+      providersTried?: Provider[];
+    };
+
+    const runPhase = async (label: 'phase0' | 'phase123'): Promise<PhaseResult> => {
+      const phaseOpts = label === 'phase0'
+        ? { skipProduct: true }
+        : { skipCI: true };
+      const phasePrompt = buildAnalysisPrompt(profile, ciRaw, hotModules, phaseOpts);
+      const maxTurns = label === 'phase0' ? 15 : 60;
+      const r = await invokeLLMWithFallback(
+        phasePrompt,
+        `${tmpDir}/repo`,
+        { ...baseCfg, maxTurns },
+        { allowFallback }
+      );
+      return {
+        label,
+        ok: r.ok,
+        stdout: r.stdout,
+        costUsd: r.costUsd,
+        durationMs: r.durationMs,
+        error: r.error,
+        actualProvider: r.provider ?? effectiveProvider,
+        providersTried: r.providersTried,
+      };
+    };
+
+    // Phase 0 always runs. Phase 1-3 runs unless the caller explicitly
+    // asked for CI-only (skipProduct=true via `edward ci-audit`).
+    const wantPhase0 = true;
+    const wantPhase123 = !opts?.skipProduct;
+
+    const phases: Promise<PhaseResult>[] = [];
+    if (wantPhase0) phases.push(runPhase('phase0'));
+    if (wantPhase123) phases.push(runPhase('phase123'));
+
+    console.log(`[edward] Running ${phases.length} parallel LLM ${phases.length === 1 ? 'call' : 'calls'} (phase0=${wantPhase0}, phase123=${wantPhase123})`);
+    const phaseResults = await Promise.all(phases);
+
+    let totalCost = 0;
+    let combinedParsed: ParsedAnalysis = { ci_findings: [], phase_1_2_3_findings: [], scorecard: null };
+    for (const pr of phaseResults) {
+      totalCost += pr.costUsd;
+      const triedLabel =
+        pr.providersTried && pr.providersTried.length > 1
+          ? ` (tried: ${pr.providersTried.join('→')})`
+          : '';
+      console.log(
+        `[edward] ${pr.label} ${pr.actualProvider} response: cost=$${pr.costUsd.toFixed(2)}, ` +
+        `duration=${pr.durationMs}ms, ok=${pr.ok}${triedLabel}`
+      );
+      if (!pr.ok) {
+        console.error(`[edward] ${pr.label} ${pr.actualProvider} error: ${pr.error?.slice(0, 500) || '(unknown)'}`);
+        continue; // let the other phase still contribute
+      }
+      console.log(`[edward] ${pr.label} raw preview: ${pr.stdout.slice(0, 200)}...`);
+      const phaseParsed = parseAnalysisResult(pr.stdout);
+      // Merge: phase0 contributes ci_findings + scorecard; phase123 contributes phase_1_2_3_findings.
+      // We accept ci_* output from whichever phase produced it (defensive — if the LLM ignored the
+      // split instruction we still capture what it gave us).
+      if (phaseParsed.ci_findings.length > 0) {
+        combinedParsed.ci_findings.push(...phaseParsed.ci_findings);
+      }
+      if (phaseParsed.phase_1_2_3_findings.length > 0) {
+        combinedParsed.phase_1_2_3_findings.push(...phaseParsed.phase_1_2_3_findings);
+      }
+      if (phaseParsed.scorecard && !combinedParsed.scorecard) {
+        combinedParsed.scorecard = phaseParsed.scorecard;
+      }
+    }
+
+    if (phaseResults.every(p => !p.ok)) {
       return { tasks: [], scorecard: null };
     }
 
-    console.log(`[edward] Raw result preview: ${result.stdout.slice(0, 300)}...`);
-
-    // Parse with the balanced-bracket parser from fix/parser-and-clone-auth.
-    // Input is provider-neutralized (invokeLLM returns the final text
-    // regardless of whether claude or codex produced it).
-    const parsed = parseAnalysisResult(result.stdout);
+    const parsed = combinedParsed;
+    console.log(`[edward] combined cost=$${totalCost.toFixed(2)} across ${phaseResults.length} phase(s)`);
 
     // Stamp scorecard.generated_at if the LLM omitted it
     if (parsed.scorecard && !parsed.scorecard.generated_at) {
@@ -894,6 +995,84 @@ async function analyzeRepoWithAgent(
 
     const allRaw = [...parsed.ci_findings, ...parsed.phase_1_2_3_findings];
     const tasks = allRaw.map(toEdwardTask).filter((t): t is EdwardTask => t !== null);
+
+    // CR #1 + #3 fix: deterministic "no CI at all" guarantee.
+    //
+    // The "repo has zero CI → user sees a P1 suggestion" path was previously
+    // 100% delegated to the LLM. Every failure mode (LLM confidence <0.7,
+    // misclassified as test_gap, emitted scorecard but empty findings, parse
+    // failure) dropped the finding silently. Since this is a product-level
+    // must-have, we synthesize the ci_missing task in code whenever
+    // CI_CONFIG_FILES is empty, then let the LLM findings refine it via
+    // type+title dedupe below.
+    if (ciRaw.configFiles.length === 0) {
+      const already = tasks.some(t => t.type === 'ci_missing');
+      if (!already) {
+        const synth: EdwardTask = {
+          id: uuid(),
+          repo_id: '',
+          signal_ids: [],
+          type: 'ci_missing',
+          status: 'suggested',
+          title: 'Repository has no CI configuration at all',
+          description:
+            `No CI config files were detected by static extraction (providers scanned: ` +
+            `github_actions, gitlab_ci, circleci, jenkins, travis, buildkite, azure_pipelines).\n\n` +
+            `**User impact:** every change to this repo ships unverified. Regressions, ` +
+            `broken builds, security vulnerabilities in dependencies, and test failures ` +
+            `reach main without any automated check. This is a P1 gap for any repo with ` +
+            `executable code.\n\n` +
+            `**Suggested first step:** add a minimal CI pipeline (install + lint + test) ` +
+            `on push and pull_request. For a ${profile.stacks.join('/') || 'this'} ` +
+            `${profile.roles.join('/') || 'project'}, a single GitHub Actions workflow ` +
+            `is typically enough to establish the baseline.`,
+          evidence: {
+            signals: [
+              `REPO_PROFILE: roles=[${profile.roles.join(',')}], stacks=[${profile.stacks.join(',')}], topology=${profile.topology}`,
+              `CI_CONFIG_FILES: 0 files across all known providers`,
+            ],
+            source: 'deterministic_static_extraction',
+          },
+          impact: {
+            estimatedFiles: ['.github/workflows/ci.yml'],
+            estimatedLinesChanged: 40,
+            blastRadius: 'isolated',
+          },
+          verification: {
+            method: 'Workflow runs on a test PR and gates merge',
+            steps: [
+              'Create .github/workflows/ci.yml with install + lint + test stages',
+              'Open a PR; confirm the workflow triggers and all steps pass',
+              'Enable branch protection to require the check on the default branch',
+            ],
+            successCriteria: [
+              'CI workflow visible in the Actions tab',
+              'PRs cannot merge unless the check passes',
+            ],
+          },
+          confidence: 1.0,
+          risk_level: 'high',
+          suggested_at: new Date().toISOString(),
+          approved_at: null,
+          completed_at: null,
+          dismiss_reason: null,
+          snooze_until: null,
+          execution_id: null,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        };
+        tasks.unshift(synth);
+        console.log(`[edward] Synthesized deterministic ci_missing task (no CI detected)`);
+      } else {
+        // LLM already emitted a ci_missing finding. Force risk_level=high
+        // since this is the no-CI case (CR #3: LLM default was 'low').
+        for (const t of tasks) {
+          if (t.type === 'ci_missing' && t.risk_level !== 'high') {
+            t.risk_level = 'high';
+          }
+        }
+      }
+    }
 
     console.log(`[edward] Parsed ${tasks.length} tasks (${parsed.ci_findings.length} CI + ${parsed.phase_1_2_3_findings.length} product), scorecard=${parsed.scorecard ? 'yes' : 'no'}`);
 
@@ -1086,8 +1265,44 @@ interface ParsedAnalysis {
  *
  * Never throws.
  */
+/**
+ * Strip trailing prose from a JSON response. Walks from the last `}`
+ * backwards looking for a depth-zero match to an earlier `{` such that
+ * the slice in between is itself valid JSON. Used as an Attempt 2.5
+ * between the "direct parse" and "greedy [...]" strategies.
+ *
+ * Returns null if no parseable {...} prefix is found.
+ */
+function stripTrailingProseAndParse(text: string): any | null {
+  // Try progressively earlier `}` positions. Cheap and bounded: most
+  // malformed responses only need one or two retries.
+  let searchEnd = text.length;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const lastClose = text.lastIndexOf('}', searchEnd - 1);
+    if (lastClose < 0) return null;
+    const firstOpen = text.indexOf('{');
+    if (firstOpen < 0 || firstOpen >= lastClose) return null;
+    const slice = text.slice(firstOpen, lastClose + 1);
+    try {
+      return JSON.parse(slice);
+    } catch {
+      searchEnd = lastClose;
+    }
+  }
+  return null;
+}
+
 function parseAnalysisResult(text: string): ParsedAnalysis {
   const empty: ParsedAnalysis = { ci_findings: [], phase_1_2_3_findings: [], scorecard: null };
+
+  // Always dump the raw text so post-mortem doesn't require re-running
+  // the (expensive) discover. Cheap: it's a few hundred KB at most, and
+  // each run gets its own file. Useful regardless of parse success.
+  try {
+    const dumpPath = `/tmp/edward-raw-analysis-${Date.now()}.txt`;
+    writeFileSync(dumpPath, text, 'utf-8');
+    console.log(`[edward] Raw LLM output dumped to ${dumpPath} (${text.length} bytes)`);
+  } catch { /* best effort */ }
 
   const tryShape = (parsed: any): ParsedAnalysis | null => {
     if (!parsed) return null;
@@ -1098,17 +1313,40 @@ function parseAnalysisResult(text: string): ParsedAnalysis {
       const scorecard: CIScorecard | null = parsed.ci_scorecard && typeof parsed.ci_scorecard === 'object'
         ? parsed.ci_scorecard
         : null;
-      if (ci.length > 0 || p123.length > 0 || scorecard) {
+      // Accept the object if it has ANY of the three expected keys — even if
+      // all three are empty/null. A correct-shape-but-empty result (LLM
+      // legitimately found nothing) must not be misclassified as a parse
+      // failure; that was the CR #2 bug, which combined with CR #1 burned
+      // $1+ runs and showed users "0 findings" + a /tmp dump.
+      const hasKnownKey =
+        'ci_findings' in parsed ||
+        'phase_1_2_3_findings' in parsed ||
+        'ci_scorecard' in parsed;
+      if (hasKnownKey) {
         return { ci_findings: ci, phase_1_2_3_findings: p123, scorecard };
       }
-      // Object that doesn't match the new shape — give up on this attempt
-      // (don't fall through to "treat as phase_1_2_3" here, the wrong-shape
-      // object would be silently dropped which is exactly the bug we're
-      // fixing).
+      // Object lacks every known key — wrong shape, give up on this attempt
+      // (don't fall through to "treat as phase_1_2_3" here, a wrong-shape
+      // object would be silently dropped).
       return null;
     }
-    // Legacy flat array of tasks
+    // Legacy flat array of tasks — STRICT: every element must look like
+    // a task object (has .title and is an object). This prevents a very
+    // nasty failure mode we hit on ama-user-service:
+    //   Attempt 1 failed (malformed outer JSON)
+    //   Attempt 2 failed (same slice, still malformed)
+    //   Attempt 3 grabbed the FIRST `[...]` slice, which turned out to
+    //     be `ci_scorecard.dimensions.presence.evidence`: an array of
+    //     strings describing CI files. JSON.parse succeeded because
+    //     a string array is valid JSON; tryShape saw Array.isArray →
+    //     returned them as phase_1_2_3_findings. Downstream
+    //     toEdwardTask rejected all of them (no .title) → 0 tasks
+    //     saved, scorecard=no, and the user lost a 14-minute $1.45 run.
     if (Array.isArray(parsed)) {
+      const looksLikeTasks = parsed.length > 0 && parsed.every(
+        t => t && typeof t === 'object' && typeof t.title === 'string'
+      );
+      if (!looksLikeTasks) return null;
       return { ci_findings: [], phase_1_2_3_findings: parsed, scorecard: null };
     }
     return null;
@@ -1129,6 +1367,21 @@ function parseAnalysisResult(text: string): ParsedAnalysis {
       const shaped = tryShape(parsed);
       if (shaped) return shaped;
     } catch { /* try next */ }
+  }
+
+  // Attempt 2.5: strip trailing prose. If the LLM added a postscript
+  // after the JSON body (e.g. "Note: this analysis took 80 turns."),
+  // both Attempt 1 (trailing text) and Attempt 2 (still parses because
+  // findFirstBalancedJson returns the full outer slice which is valid)
+  // should have already succeeded. This attempt is for the OTHER
+  // failure mode: the outer {...} IS malformed JSON (missing comma,
+  // unescaped quote, trailing comma) but a strict PREFIX of it is
+  // valid. Walk back from the last `}` to find the longest parseable
+  // prefix.
+  const prefixParsed = stripTrailingProseAndParse(text);
+  if (prefixParsed) {
+    const shaped = tryShape(prefixParsed);
+    if (shaped) return shaped;
   }
 
   // Attempt 3: first balanced [...] array (legacy v0.3 shape)
@@ -1214,6 +1467,7 @@ async function handleRequest(req: Request): Promise<Response> {
     return json({
       scorecard: repo.settings.ci_scorecard ?? null,
       generated_at: repo.settings.ci_scorecard_at ?? null,
+      last_discover_at: repo.settings.last_discover_at ?? null,
     });
   }
 
@@ -1267,6 +1521,23 @@ async function handleRequest(req: Request): Promise<Response> {
     discoveryRunning = true;
 
     const skipProduct = url.searchParams.get('skip_product') === '1';
+    const noFallback = url.searchParams.get('no_fallback') === '1';
+
+    // Optional ?branch=<name> to scan a non-default branch. Validated
+    // against a conservative ref-name regex so we don't shell-inject
+    // into `git clone --branch`. Matches common branch/tag naming
+    // without being overly strict — allows foo/bar, feature-123,
+    // v1.2.3, release.2026-04-08.
+    const branchParam = url.searchParams.get('branch');
+    let branch: string | undefined;
+    if (branchParam !== null && branchParam !== '') {
+      if (!/^[A-Za-z0-9._/\-]{1,200}$/.test(branchParam) ||
+          branchParam.startsWith('-') ||
+          branchParam.includes('..')) {
+        return json({ error: `Invalid branch '${branchParam}'. Only [A-Za-z0-9._/-] allowed, no leading '-', no '..'` }, 400);
+      }
+      branch = branchParam;
+    }
 
     // Run in background — return immediately
     (async () => {
@@ -1274,16 +1545,21 @@ async function handleRequest(req: Request): Promise<Response> {
         const logOpts = [
           skipProduct ? 'skip_product' : null,
           provider ? `provider=${provider}` : null,
+          branch ? `branch=${branch}` : null,
         ].filter(Boolean).join(', ');
         console.log(`[edward] Running agent analysis for ${repo.full_name}${logOpts ? ` (${logOpts})` : ''}...`);
-        const result = await analyzeRepoWithAgent(repo.full_name, { skipProduct, provider });
+        const result = await analyzeRepoWithAgent(repo.full_name, { skipProduct, provider, allowFallback: !noFallback, branch });
+
+        // Stamp "discovery ran" regardless of outcome so the dashboard can
+        // distinguish "never ran" vs "ran but no scorecard returned" (CR #4).
+        repo.settings.last_discover_at = new Date().toISOString();
+        repo.updated_at = new Date().toISOString();
 
         // Persist the scorecard onto the repo's settings field (existing
         // extensible Record<string, unknown>, no schema migration needed).
         if (result.scorecard) {
           repo.settings.ci_scorecard = result.scorecard;
           repo.settings.ci_scorecard_at = new Date().toISOString();
-          repo.updated_at = new Date().toISOString();
         }
 
         // Save tasks (with dedupe). Cap raised from 15 to 50 to
@@ -1337,7 +1613,7 @@ async function handleRequest(req: Request): Promise<Response> {
         task.approved_at = new Date().toISOString();
         const exec: EdwardExecution = {
           id: uuid(), task_id: task.id, repo_id: task.repo_id, status: 'queued',
-          agent_provider: 'claude_code', branch_name: `edward/${task.type}-${Date.now().toString(36)}`,
+          agent_provider: 'edward_runtime', branch_name: `edward/${task.type}-${Date.now().toString(36)}`,
           pr_url: null, logs: [{ timestamp: new Date().toISOString(), level: 'info', message: 'Task approved, execution queued' }],
           started_at: null, completed_at: null, created_at: new Date().toISOString(),
         };

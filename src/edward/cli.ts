@@ -95,6 +95,8 @@ interface ParsedArgs {
   help: boolean;
   yes: boolean;
   provider?: Provider;
+  noFallback?: boolean;
+  branch?: string;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -110,6 +112,9 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (a === '--until') { out.until = argv[++i]; }
     else if (a === '--port' || a === '-p') { out.port = parseInt(argv[++i] || '0', 10); }
     else if (a === '--provider') { out.provider = parseProvider(argv[++i]); }
+    else if (a === '--no-fallback') { out.noFallback = true; }
+    else if (a === '--branch' || a === '-b') { out.branch = argv[++i]; }
+    else if (a.startsWith('--branch=')) { out.branch = a.slice(9); }
     else if (a.startsWith('--url=')) { out.url = a.slice(6); }
     else if (a.startsWith('--reason=')) { out.reason = a.slice(9); }
     else if (a.startsWith('--until=')) { out.until = a.slice(8); }
@@ -531,6 +536,8 @@ async function runDiscoverFlow(args: ParsedArgs, opts: { skipProduct: boolean })
   const params = new URLSearchParams();
   if (opts.skipProduct) params.set('skip_product', '1');
   params.set('provider', provider);
+  if (args.noFallback) params.set('no_fallback', '1');
+  if (args.branch) params.set('branch', args.branch);
   const discoverUrl = `/api/v1/repos/${repo.id}/discover?${params.toString()}`;
   const start = await api<{ message: string }>(
     args.url,
@@ -766,6 +773,8 @@ ${b}FLAGS${r}
   --wait                           Block until discovery finishes (for discover)
   --yes, -y                        Skip interactive confirmation (for serve)
   --provider claude|codex          LLM backend to use (default: claude; codex = GPT via ChatGPT OAuth)
+  --no-fallback                    Disable auto-fallback to the other provider on retriable error (for discover)
+  --branch NAME, -b NAME           Scan a specific branch instead of the repo default (for discover / ci-audit)
   --reason "..."                   Reason for dismiss
   --until ISO                      ISO timestamp for snooze
 
@@ -776,6 +785,7 @@ ${b}EXAMPLES${r}
   edward repos add teamo-lab/clawschool
   edward discover teamo-lab/clawschool --wait
   edward discover teamo-lab/clawschool --wait --provider codex
+  edward discover floatmiracle/ama-user-service --branch shufanci --wait
   edward suggestions teamo-lab/clawschool
   edward approve a1b2c3d4
   edward dismiss a1b2c3d4 --reason "won't fix"
@@ -785,6 +795,7 @@ ${b}ENVIRONMENT${r}
   EDWARD_URL         Server URL for CLI commands (default: http://localhost:8080)
   EDWARD_PORT        Port for 'edward serve' (default: 8080)
   EDWARD_PROVIDER    Default LLM provider (claude|codex). Overridden by --provider flag.
+  EDWARD_NO_FALLBACK If set to 1, disables auto-fallback to the other provider on retriable errors.
   CLAUDE_BIN         Override auto-detection of the \`claude\` CLI binary
   CODEX_BIN          Override auto-detection of the \`codex\` CLI binary
   ANTHROPIC_API_KEY  If set, claude runs bill to that API account instead of OAuth.

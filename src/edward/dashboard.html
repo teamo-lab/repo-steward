@@ -419,7 +419,18 @@ async function loadCIScorecard() {
 
   if (!sc) {
     scoreEl.innerHTML = '';
-    bodyEl.innerHTML = '<div class="ci-empty"><div class="icon">&#128202;</div>CI scorecard not yet generated.<br>Run <code>edward discover</code> or <code>edward ci-audit</code>.</div>';
+    if (data.last_discover_at) {
+      // CR #4 fix: distinguish "never ran" vs "ran but no scorecard returned".
+      // The common case here is "repo has no CI at all" — the LLM produced
+      // no scorecard but the deterministic ci_missing task is in Suggestions.
+      bodyEl.innerHTML =
+        '<div class="ci-empty"><div class="icon">&#9888;&#65039;</div>' +
+        'Discovery ran but no CI scorecard was returned.<br>' +
+        'Most likely this repo has <strong>no CI configuration at all</strong> — ' +
+        'see the <code>ci_missing</code> suggestion below for the fix.</div>';
+    } else {
+      bodyEl.innerHTML = '<div class="ci-empty"><div class="icon">&#128202;</div>CI scorecard not yet generated.<br>Run <code>edward discover</code> or <code>edward ci-audit</code>.</div>';
+    }
     return;
   }
 
