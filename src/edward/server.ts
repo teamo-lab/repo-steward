@@ -695,10 +695,12 @@ function buildAnalysisPrompt(
   profile: RepoProfile,
   ciRaw: CIRawConfig,
   hotModules: HotModule[],
-  opts?: { skipProduct?: boolean }
+  opts?: { skipProduct?: boolean; skipCI?: boolean }
 ): string {
   const skipNote = opts?.skipProduct
     ? '\n\nIMPORTANT: Skip Phases 1, 1.5, 2, and 3 entirely. Only run Phase 0 (CI Health Audit). Return ci_scorecard + ci_findings, with phase_1_2_3_findings as an empty array.\n'
+    : opts?.skipCI
+    ? '\n\nIMPORTANT: Skip Phase 0 (CI Health Audit) entirely. Another parallel run is handling CI. Return ci_findings as an empty array and ci_scorecard as null. Focus all turns on Phases 1, 1.5, 2, and 3 (product understanding, hot-module deep-dive, functional bugs).\n'
     : '';
 
   // Cap CI files in prompt to keep size manageable. Each file already
@@ -908,49 +910,113 @@ async function analyzeRepoWithAgent(
       console.log(`[edward] hot modules: none (no git history or coverage data)`);
     }
 
-    // Build the per-run prompt (Phase 0 CI audit + Phase 1.5 hot modules + Phase 1-3)
-    const prompt = buildAnalysisPrompt(profile, ciRaw, hotModules, opts);
-
     // Dispatch through the provider abstraction. invokeLLMWithFallback
     // handles binary resolution, spawn, env scrubbing, error capture,
     // output normalization, AND auto-retry on the other provider if
-    // the primary returns a retriable error (529 / overload / network /
-    // timeout / spawn failure).
+    // the primary returns a retriable error.
     const allowFallback =
       opts?.allowFallback !== false && process.env.EDWARD_NO_FALLBACK !== '1';
-    const result = await invokeLLMWithFallback(
-      prompt,
-      `${tmpDir}/repo`,
-      {
-        provider: effectiveProvider,
-        model: effectiveProvider === 'claude' ? 'sonnet' : undefined,
-        maxTurns: 80,            // honored by claude path; ignored by codex
-        maxBudgetUsd: 5,         // honored by claude path; ignored by codex
-        timeoutMs: 1_200_000,    // 20 min hard ceiling for either provider
-      },
-      { allowFallback }
-    );
+    const baseCfg = {
+      provider: effectiveProvider,
+      model: effectiveProvider === 'claude' ? 'sonnet' : undefined,
+      maxBudgetUsd: 5,
+      timeoutMs: 1_200_000,
+    };
 
-    const actualProvider = result.provider ?? effectiveProvider;
-    const triedLabel =
-      result.providersTried && result.providersTried.length > 1
-        ? ` (tried: ${result.providersTried.join('→')})`
-        : '';
-    console.log(
-      `[edward] ${actualProvider} response: cost=$${result.costUsd.toFixed(2)}, ` +
-      `duration=${result.durationMs}ms, ok=${result.ok}${triedLabel}`
-    );
-    if (!result.ok) {
-      console.error(`[edward] ${actualProvider} error: ${result.error?.slice(0, 500) || '(unknown)'}`);
+    // A3 performance fix: split Phase 0 (CI audit, fast, bounded — no
+    // repo file reads needed) and Phase 1-3 (product bug hunt, heavy,
+    // reads many files) into two parallel LLM calls. Wall time becomes
+    // max(phase0, phase123) instead of phase0 + phase123. Phase 0 also
+    // gets a tighter turn cap since it operates entirely on the data
+    // already inlined in the prompt (REPO_PROFILE + CI_CONFIG_FILES).
+    //
+    // Respects the original skipProduct / skipCI opts: if the caller
+    // asked for only one half, we just run that half sequentially.
+    type PhaseResult = {
+      label: 'phase0' | 'phase123';
+      ok: boolean;
+      stdout: string;
+      costUsd: number;
+      durationMs: number;
+      error?: string;
+      actualProvider: Provider;
+      providersTried?: Provider[];
+    };
+
+    const runPhase = async (label: 'phase0' | 'phase123'): Promise<PhaseResult> => {
+      const phaseOpts = label === 'phase0'
+        ? { skipProduct: true }
+        : { skipCI: true };
+      const phasePrompt = buildAnalysisPrompt(profile, ciRaw, hotModules, phaseOpts);
+      const maxTurns = label === 'phase0' ? 15 : 60;
+      const r = await invokeLLMWithFallback(
+        phasePrompt,
+        `${tmpDir}/repo`,
+        { ...baseCfg, maxTurns },
+        { allowFallback }
+      );
+      return {
+        label,
+        ok: r.ok,
+        stdout: r.stdout,
+        costUsd: r.costUsd,
+        durationMs: r.durationMs,
+        error: r.error,
+        actualProvider: r.provider ?? effectiveProvider,
+        providersTried: r.providersTried,
+      };
+    };
+
+    // Phase 0 always runs. Phase 1-3 runs unless the caller explicitly
+    // asked for CI-only (skipProduct=true via `edward ci-audit`).
+    const wantPhase0 = true;
+    const wantPhase123 = !opts?.skipProduct;
+
+    const phases: Promise<PhaseResult>[] = [];
+    if (wantPhase0) phases.push(runPhase('phase0'));
+    if (wantPhase123) phases.push(runPhase('phase123'));
+
+    console.log(`[edward] Running ${phases.length} parallel LLM ${phases.length === 1 ? 'call' : 'calls'} (phase0=${wantPhase0}, phase123=${wantPhase123})`);
+    const phaseResults = await Promise.all(phases);
+
+    let totalCost = 0;
+    let combinedParsed: ParsedAnalysis = { ci_findings: [], phase_1_2_3_findings: [], scorecard: null };
+    for (const pr of phaseResults) {
+      totalCost += pr.costUsd;
+      const triedLabel =
+        pr.providersTried && pr.providersTried.length > 1
+          ? ` (tried: ${pr.providersTried.join('→')})`
+          : '';
+      console.log(
+        `[edward] ${pr.label} ${pr.actualProvider} response: cost=$${pr.costUsd.toFixed(2)}, ` +
+        `duration=${pr.durationMs}ms, ok=${pr.ok}${triedLabel}`
+      );
+      if (!pr.ok) {
+        console.error(`[edward] ${pr.label} ${pr.actualProvider} error: ${pr.error?.slice(0, 500) || '(unknown)'}`);
+        continue; // let the other phase still contribute
+      }
+      console.log(`[edward] ${pr.label} raw preview: ${pr.stdout.slice(0, 200)}...`);
+      const phaseParsed = parseAnalysisResult(pr.stdout);
+      // Merge: phase0 contributes ci_findings + scorecard; phase123 contributes phase_1_2_3_findings.
+      // We accept ci_* output from whichever phase produced it (defensive — if the LLM ignored the
+      // split instruction we still capture what it gave us).
+      if (phaseParsed.ci_findings.length > 0) {
+        combinedParsed.ci_findings.push(...phaseParsed.ci_findings);
+      }
+      if (phaseParsed.phase_1_2_3_findings.length > 0) {
+        combinedParsed.phase_1_2_3_findings.push(...phaseParsed.phase_1_2_3_findings);
+      }
+      if (phaseParsed.scorecard && !combinedParsed.scorecard) {
+        combinedParsed.scorecard = phaseParsed.scorecard;
+      }
+    }
+
+    if (phaseResults.every(p => !p.ok)) {
       return { tasks: [], scorecard: null };
     }
 
-    console.log(`[edward] Raw result preview: ${result.stdout.slice(0, 300)}...`);
-
-    // Parse with the balanced-bracket parser from fix/parser-and-clone-auth.
-    // Input is provider-neutralized (invokeLLM returns the final text
-    // regardless of whether claude or codex produced it).
-    const parsed = parseAnalysisResult(result.stdout);
+    const parsed = combinedParsed;
+    console.log(`[edward] combined cost=$${totalCost.toFixed(2)} across ${phaseResults.length} phase(s)`);
 
     // Stamp scorecard.generated_at if the LLM omitted it
     if (parsed.scorecard && !parsed.scorecard.generated_at) {
