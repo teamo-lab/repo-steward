@@ -1,6 +1,6 @@
-# CODEOWNERS — every PR into a protected branch (main, edward) must be
-# approved by @yumi-agent before merge. This pairs with the repository
-# ruleset "Require PR review from code owners".
+# CODEOWNERS — every PR into `main` must be approved by @yumi-agent
+# before merge. This pairs with the repository ruleset "Require PR
+# review from code owners".
 #
 # Syntax: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-security/customizing-your-repository/about-code-owners
 
