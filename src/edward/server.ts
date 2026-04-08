@@ -12,6 +12,7 @@ import { spawn, spawnSync, execSync } from 'node:child_process';
 import { detectRepoProfile, type RepoProfile } from './profile.js';
 import { extractCIRawConfig, type CIRawConfig } from './ci_extract.js';
 import { detectHotModules, type HotModule } from './hot_modules.js';
+import { invokeLLM, isProvider, type Provider } from './llm_provider.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DASHBOARD_HTML_PATH = join(__dirname, 'dashboard.html');
@@ -824,15 +825,20 @@ interface AnalyzeResult {
 
 async function analyzeRepoWithAgent(
   fullName: string,
-  opts?: { skipProduct?: boolean }
+  opts?: { skipProduct?: boolean; provider?: Provider }
 ): Promise<AnalyzeResult> {
   const tmpDir = `/tmp/edward-${Date.now()}`;
+
+  // Effective provider: explicit flag → env var → default claude.
+  const envProvider = process.env.EDWARD_PROVIDER;
+  const effectiveProvider: Provider =
+    opts?.provider ??
+    (envProvider && isProvider(envProvider) ? envProvider : 'claude');
 
   try {
     // Clone — pass GITHUB_TOKEN via http.extraheader so private repos
     // and rate-limited unauthenticated egress paths actually work.
-    // We deliberately do NOT embed the token in the URL: that leaks it
-    // into process listings, error messages, and git config.
+    // We deliberately do NOT embed the token in the URL.
     cloneRepoWithToken(fullName, `${tmpDir}/repo`);
 
     // Layer 1 + 2 + 3: profile, CI extraction, and hot-module detection
@@ -847,64 +853,41 @@ async function analyzeRepoWithAgent(
       console.log(`[edward] hot modules: none (no git history or coverage data)`);
     }
 
-    // Build the per-run prompt
+    // Build the per-run prompt (Phase 0 CI audit + Phase 1.5 hot modules + Phase 1-3)
     const prompt = buildAnalysisPrompt(profile, ciRaw, hotModules, opts);
 
-    // Run claude subprocess
-    const env = { ...process.env } as Record<string, string>;
-    delete env.CLAUDECODE;
-    delete env.CLAUDE_CODE_ENTRYPOINT;
-
-    let binPath: string;
-    try {
-      binPath = resolveClaudeBin();
-    } catch (err: any) {
-      console.error(`[edward] ${err.message}`);
-      return { tasks: [], scorecard: null };
-    }
-
-    const stdout = await new Promise<string>((resolve, reject) => {
-      const proc = spawn(binPath, [
-        '-p', prompt,
-        '--output-format', 'json',
-        '--dangerously-skip-permissions',
-        '--no-session-persistence',
-        '--model', 'sonnet',
-        // 80 turns: prior 40-turn cap was hitting before exploration finished
-        // on real codebases. Budget cap ($5) is the second safety net.
-        '--max-turns', '80',
-        '--max-budget-usd', '5',
-      ], {
-        cwd: `${tmpDir}/repo`,
-        env,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-
-      let out = '';
-      proc.stdout!.on('data', (d: Buffer) => { out += d.toString(); });
-      const timer = setTimeout(() => { proc.kill('SIGTERM'); }, 1_200_000); // 20 min for deep analysis
-      proc.on('close', () => { clearTimeout(timer); resolve(out); });
-      proc.on('error', (e) => { clearTimeout(timer); reject(e); });
+    // Dispatch through the provider abstraction. invokeLLM handles
+    // binary resolution, spawn, env scrubbing, error capture, and
+    // output normalization for both claude and codex.
+    const result = await invokeLLM(prompt, `${tmpDir}/repo`, {
+      provider: effectiveProvider,
+      model: effectiveProvider === 'claude' ? 'sonnet' : undefined,
+      maxTurns: 80,            // honored by claude path; ignored by codex
+      maxBudgetUsd: 5,         // honored by claude path; ignored by codex
+      timeoutMs: 1_200_000,    // 20 min hard ceiling for either provider
     });
 
-    const result = JSON.parse(stdout);
-    console.log(`[edward] Claude response: cost=$${result.total_cost_usd?.toFixed(2)}, duration=${result.duration_ms}ms, error=${result.is_error}`);
-    if (result.is_error || !result.result) {
-      console.error(`[edward] Claude error: ${result.result?.slice?.(0, 200)}`);
+    console.log(
+      `[edward] ${effectiveProvider} response: cost=$${result.costUsd.toFixed(2)}, ` +
+      `duration=${result.durationMs}ms, ok=${result.ok}`
+    );
+    if (!result.ok) {
+      console.error(`[edward] ${effectiveProvider} error: ${result.error?.slice(0, 300) || '(unknown)'}`);
       return { tasks: [], scorecard: null };
     }
 
-    console.log(`[edward] Raw result preview: ${result.result.slice(0, 300)}...`);
+    console.log(`[edward] Raw result preview: ${result.stdout.slice(0, 300)}...`);
 
-    // Parse — try the new shape first, fall back to the old flat array shape
-    // (kept as a graceful degradation in case Claude regresses to v0.3 format).
-    const parsed = parseAnalysisResult(result.result);
+    // Parse with the balanced-bracket parser from fix/parser-and-clone-auth.
+    // Input is provider-neutralized (invokeLLM returns the final text
+    // regardless of whether claude or codex produced it).
+    const parsed = parseAnalysisResult(result.stdout);
 
-    // Stamp scorecard.generated_at if Claude omitted it
+    // Stamp scorecard.generated_at if the LLM omitted it
     if (parsed.scorecard && !parsed.scorecard.generated_at) {
       parsed.scorecard.generated_at = new Date().toISOString();
     }
-    // Stamp scorecard.provider if Claude omitted it
+    // Stamp scorecard.provider if the LLM omitted it
     if (parsed.scorecard && !parsed.scorecard.provider) {
       parsed.scorecard.provider = ciRaw.provider;
     }
@@ -1269,6 +1252,17 @@ async function handleRequest(req: Request): Promise<Response> {
     const repo = repos.get(discoverMatch[1]);
     if (!repo) return json({ error: 'Repo not found' }, 404);
 
+    // Optional ?provider=claude|codex query param. Reject invalid values
+    // so silent fallback to default doesn't mask a misconfigured client.
+    const providerParam = url.searchParams.get('provider');
+    let provider: Provider | undefined;
+    if (providerParam !== null) {
+      if (!isProvider(providerParam)) {
+        return json({ error: `Invalid provider '${providerParam}'. Valid: claude, codex` }, 400);
+      }
+      provider = providerParam;
+    }
+
     if (discoveryRunning) return json({ tasks: [], count: 0, message: 'Discovery already running' });
     discoveryRunning = true;
 
@@ -1277,8 +1271,12 @@ async function handleRequest(req: Request): Promise<Response> {
     // Run in background — return immediately
     (async () => {
       try {
-        console.log(`[edward] Running agent analysis for ${repo.full_name}${skipProduct ? ' (skip_product)' : ''}...`);
-        const result = await analyzeRepoWithAgent(repo.full_name, { skipProduct });
+        const logOpts = [
+          skipProduct ? 'skip_product' : null,
+          provider ? `provider=${provider}` : null,
+        ].filter(Boolean).join(', ');
+        console.log(`[edward] Running agent analysis for ${repo.full_name}${logOpts ? ` (${logOpts})` : ''}...`);
+        const result = await analyzeRepoWithAgent(repo.full_name, { skipProduct, provider });
 
         // Persist the scorecard onto the repo's settings field (existing
         // extensible Record<string, unknown>, no schema migration needed).
