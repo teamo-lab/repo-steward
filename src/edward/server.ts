@@ -11,6 +11,8 @@ import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync, execSync } from 'node:child_process';
 import { detectRepoProfile, type RepoProfile } from './profile.js';
 import { extractCIRawConfig, type CIRawConfig } from './ci_extract.js';
+import { detectHotModules, type HotModule } from './hot_modules.js';
+import { invokeLLM, isProvider, type Provider } from './llm_provider.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DASHBOARD_HTML_PATH = join(__dirname, 'dashboard.html');
@@ -444,6 +446,54 @@ app.use, Next.js pages/api, Go gin.Engine, Rust router::new etc.) to
 build a complete entry-point inventory before moving to Phase 2.
 
 ══════════════════════════════════════
+PHASE 1.5 — MANDATORY HOT-MODULE DEEP-DIVE (run BEFORE Phase 2)
+══════════════════════════════════════
+
+You will be given a HOT_MODULES list at the bottom of this prompt
+(possibly empty). Each entry is a file path that machine signals
+(git change frequency, test coverage, complexity) have flagged as
+high-risk for THIS specific repo right now.
+
+For EVERY hot module in the list, you MUST:
+
+1. Read the entire file (or all relevant sections if it is large).
+2. Trace every public function / endpoint / handler defined in it
+   end-to-end. Follow the data flow into and out of each call.
+3. Specifically check the edge cases that hot modules are most
+   likely to have:
+   - Boundary conditions: scores going DOWN after upgrades, ties,
+     negative values, zero, max-int, off-by-one in pagination.
+   - Idempotency: what happens if this endpoint / callback is
+     called twice with the same input? Lost updates? Double charges?
+     Lost points?
+   - State machine transitions: can the entity reach a state that
+     wasn't explicitly designed for? Stale "expired" → "pending"?
+     "completed" before "submitted"?
+   - Race conditions: TOCTOU between check and write, missing
+     transactions, lost updates under concurrent load.
+   - Auth bypass: does the function check authorization on EVERY
+     entry point? Including the legacy ones?
+   - Input validation: every parameter from outside (HTTP form,
+     query string, JSON body, URL path) — what if it's missing,
+     wrong type, malicious payload, very long, unicode?
+   - Cross-flow leakage: can user A read user B's data through
+     this code path?
+
+4. For each issue found, emit a finding in phase_1_2_3_findings
+   with userImpact specifying exactly what the user sees.
+
+The hot modules list is the single most reliable signal Edward has
+for "where the bugs are most likely to be hiding right now". A
+finding missed in a hot module is a much worse failure than missing
+something in a cold module — it means a real production bug in code
+that everyone has been touching has slipped through anyway.
+
+You may NOT skip a hot module because "it looks fine" or "I already
+have enough findings in that area". The list is mandatory and
+exhaustive. After you have completed every hot module, then proceed
+to Phase 2 free exploration of the rest of the codebase.
+
+══════════════════════════════════════
 PHASE 2 — FUNCTIONAL BUG HUNT (priority — most valuable findings)
 ══════════════════════════════════════
 For each critical user flow, look for issues that would cause REAL USER PAIN:
@@ -589,10 +639,11 @@ REMINDER: respond with the JSON object only. No prose, no markdown, no code fenc
 function buildAnalysisPrompt(
   profile: RepoProfile,
   ciRaw: CIRawConfig,
+  hotModules: HotModule[],
   opts?: { skipProduct?: boolean }
 ): string {
   const skipNote = opts?.skipProduct
-    ? '\n\nIMPORTANT: Skip Phases 1, 2, and 3 entirely. Only run Phase 0 (CI Health Audit). Return ci_scorecard + ci_findings, with phase_1_2_3_findings as an empty array.\n'
+    ? '\n\nIMPORTANT: Skip Phases 1, 1.5, 2, and 3 entirely. Only run Phase 0 (CI Health Audit). Return ci_scorecard + ci_findings, with phase_1_2_3_findings as an empty array.\n'
     : '';
 
   // Cap CI files in prompt to keep size manageable. Each file already
@@ -603,6 +654,13 @@ function buildAnalysisPrompt(
   const ciFilesNote = ciRaw.configFiles.length > MAX_CI_FILES_IN_PROMPT
     ? `\n(Note: ${ciRaw.configFiles.length - MAX_CI_FILES_IN_PROMPT} additional CI files exist but were omitted from the prompt for size. Their paths: ${ciRaw.configFiles.slice(MAX_CI_FILES_IN_PROMPT).map(f => f.path).join(', ')})`
     : '';
+
+  const hotModulesBlock = hotModules.length > 0
+    ? `HOT_MODULES (${hotModules.length} files Phase 1.5 MUST deep-inspect):
+${JSON.stringify(hotModules, null, 2)}`
+    : `HOT_MODULES: []
+(no machine signals available — Phase 1.5 has nothing to deep-dive,
+proceed directly from Phase 1 to Phase 2.)`;
 
   return `${ANALYSIS_PROMPT_INSTRUCTIONS}${skipNote}
 
@@ -615,42 +673,72 @@ ${JSON.stringify(profile, null, 2)}
 
 CI_CONFIG_FILES (${ciRaw.configFiles.length} files, primary provider: ${ciRaw.provider}):
 ${JSON.stringify(ciFilesForPrompt, null, 2)}${ciFilesNote}
+
+${hotModulesBlock}
 `;
 }
 
 /**
- * Clone a public or private GitHub repo at depth 1.
+ * Clone a public or private GitHub repo with enough history to compute
+ * 30-day change frequency for the hot-module detector.
  *
- * If GITHUB_TOKEN is set, authenticate via `git -c http.extraheader=...`
- * with HTTP Basic auth (`x-access-token:<TOKEN>` base64-encoded). This
- * is the form git's smart-HTTP protocol actually accepts — Bearer / token
- * headers work for the GitHub REST API but git-upload-pack will silently
- * fall back to interactive credential prompt and time out.
+ * Strategy (in order of preference):
+ *   1. --shallow-since="30 days ago" — clone exactly the last 30 days
+ *      of commits, regardless of activity level. Active repos get more,
+ *      dead repos get less. This is what we actually want.
+ *   2. --depth=100 — fallback when shallow-since fails (some git servers
+ *      don't support it; happens rarely on github but sometimes on
+ *      mirrors). 100 commits is enough for slow-to-moderate repos.
+ *   3. --depth=1 — last resort. Hot-module detection degrades to "no
+ *      change frequency available" but everything else still works.
  *
- * The token never goes into the URL, the shell, or git config — only
- * into the spawn argv, visible only to root / same-uid processes.
+ * Auth: GITHUB_TOKEN via Basic header (git smart-HTTP requires Basic,
+ * not Bearer; the token never enters URL or git config).
  *
  * Throws on clone failure. Caller's outer try/catch handles cleanup.
  */
 function cloneRepoWithToken(fullName: string, dest: string): void {
   const url = `https://github.com/${fullName}.git`;
-  const args: string[] = [];
+
+  const baseArgs: string[] = [];
   const token = process.env.GITHUB_TOKEN;
   if (token) {
     const basic = Buffer.from(`x-access-token:${token}`).toString('base64');
-    args.push('-c', `http.extraheader=Authorization: Basic ${basic}`);
+    baseArgs.push('-c', `http.extraheader=Authorization: Basic ${basic}`);
   }
-  args.push('clone', '--depth', '1', url, dest);
 
-  const result = spawnSync('git', args, {
-    timeout: 60_000,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  if (result.error) throw result.error;
-  if (result.status !== 0) {
-    const stderr = (result.stderr?.toString() || '').slice(0, 500);
-    throw new Error(`git clone failed (exit ${result.status}): ${stderr}`);
-  }
+  const tryClone = (depthArgs: string[]): { ok: boolean; stderr: string } => {
+    const args = [...baseArgs, 'clone', ...depthArgs, url, dest];
+    const r = spawnSync('git', args, {
+      timeout: 60_000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (r.error) return { ok: false, stderr: r.error.message };
+    if (r.status !== 0) {
+      return { ok: false, stderr: (r.stderr?.toString() || '').slice(0, 500) };
+    }
+    return { ok: true, stderr: '' };
+  };
+
+  // Attempt 1: shallow-since 30 days
+  let r = tryClone(['--shallow-since=30 days ago']);
+  if (r.ok) return;
+  console.log(`[edward] shallow-since clone failed, trying depth=100: ${r.stderr.slice(0, 120)}`);
+
+  // Clean up any partial clone before retrying
+  try { execSync(`rm -rf ${dest}`, { stdio: 'pipe' }); } catch {}
+
+  // Attempt 2: depth 100
+  r = tryClone(['--depth', '100']);
+  if (r.ok) return;
+  console.log(`[edward] depth=100 clone failed, falling back to depth=1: ${r.stderr.slice(0, 120)}`);
+
+  try { execSync(`rm -rf ${dest}`, { stdio: 'pipe' }); } catch {}
+
+  // Attempt 3: depth 1 (original behavior; hot-module detection will degrade)
+  r = tryClone(['--depth', '1']);
+  if (r.ok) return;
+  throw new Error(`git clone failed all 3 attempts. Last error: ${r.stderr}`);
 }
 
 /**
@@ -737,81 +825,69 @@ interface AnalyzeResult {
 
 async function analyzeRepoWithAgent(
   fullName: string,
-  opts?: { skipProduct?: boolean }
+  opts?: { skipProduct?: boolean; provider?: Provider }
 ): Promise<AnalyzeResult> {
   const tmpDir = `/tmp/edward-${Date.now()}`;
+
+  // Effective provider: explicit flag → env var → default claude.
+  const envProvider = process.env.EDWARD_PROVIDER;
+  const effectiveProvider: Provider =
+    opts?.provider ??
+    (envProvider && isProvider(envProvider) ? envProvider : 'claude');
 
   try {
     // Clone — pass GITHUB_TOKEN via http.extraheader so private repos
     // and rate-limited unauthenticated egress paths actually work.
-    // We deliberately do NOT embed the token in the URL: that leaks it
-    // into process listings, error messages, and git config.
+    // We deliberately do NOT embed the token in the URL.
     cloneRepoWithToken(fullName, `${tmpDir}/repo`);
 
-    // Layer 1 + 2: profile and CI extraction
+    // Layer 1 + 2 + 3: profile, CI extraction, and hot-module detection
     const profile = detectRepoProfile(`${tmpDir}/repo`);
     const ciRaw = extractCIRawConfig(`${tmpDir}/repo`);
+    const hotModules = detectHotModules(`${tmpDir}/repo`, { topN: 8 });
     console.log(`[edward] profile: roles=[${profile.roles.join(',')}] stacks=[${profile.stacks.join(',')}] topology=${profile.topology}`);
     console.log(`[edward] ci: provider=${ciRaw.provider} files=${ciRaw.configFiles.length}`);
-
-    // Build the per-run prompt
-    const prompt = buildAnalysisPrompt(profile, ciRaw, opts);
-
-    // Run claude subprocess
-    const env = { ...process.env } as Record<string, string>;
-    delete env.CLAUDECODE;
-    delete env.CLAUDE_CODE_ENTRYPOINT;
-
-    let binPath: string;
-    try {
-      binPath = resolveClaudeBin();
-    } catch (err: any) {
-      console.error(`[edward] ${err.message}`);
-      return { tasks: [], scorecard: null };
+    if (hotModules.length > 0) {
+      console.log(`[edward] hot modules: ${hotModules.map(m => `${m.path}(${m.metrics.changeFreq ?? '?'}c)`).join(', ')}`);
+    } else {
+      console.log(`[edward] hot modules: none (no git history or coverage data)`);
     }
 
-    const stdout = await new Promise<string>((resolve, reject) => {
-      const proc = spawn(binPath, [
-        '-p', prompt,
-        '--output-format', 'json',
-        '--dangerously-skip-permissions',
-        '--no-session-persistence',
-        '--model', 'sonnet',
-        // 80 turns: prior 40-turn cap was hitting before exploration finished
-        // on real codebases. Budget cap ($5) is the second safety net.
-        '--max-turns', '80',
-        '--max-budget-usd', '5',
-      ], {
-        cwd: `${tmpDir}/repo`,
-        env,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
+    // Build the per-run prompt (Phase 0 CI audit + Phase 1.5 hot modules + Phase 1-3)
+    const prompt = buildAnalysisPrompt(profile, ciRaw, hotModules, opts);
 
-      let out = '';
-      proc.stdout!.on('data', (d: Buffer) => { out += d.toString(); });
-      const timer = setTimeout(() => { proc.kill('SIGTERM'); }, 1_200_000); // 20 min for deep analysis
-      proc.on('close', () => { clearTimeout(timer); resolve(out); });
-      proc.on('error', (e) => { clearTimeout(timer); reject(e); });
+    // Dispatch through the provider abstraction. invokeLLM handles
+    // binary resolution, spawn, env scrubbing, error capture, and
+    // output normalization for both claude and codex.
+    const result = await invokeLLM(prompt, `${tmpDir}/repo`, {
+      provider: effectiveProvider,
+      model: effectiveProvider === 'claude' ? 'sonnet' : undefined,
+      maxTurns: 80,            // honored by claude path; ignored by codex
+      maxBudgetUsd: 5,         // honored by claude path; ignored by codex
+      timeoutMs: 1_200_000,    // 20 min hard ceiling for either provider
     });
 
-    const result = JSON.parse(stdout);
-    console.log(`[edward] Claude response: cost=$${result.total_cost_usd?.toFixed(2)}, duration=${result.duration_ms}ms, error=${result.is_error}`);
-    if (result.is_error || !result.result) {
-      console.error(`[edward] Claude error: ${result.result?.slice?.(0, 200)}`);
+    console.log(
+      `[edward] ${effectiveProvider} response: cost=$${result.costUsd.toFixed(2)}, ` +
+      `duration=${result.durationMs}ms, ok=${result.ok}`
+    );
+    if (!result.ok) {
+      console.error(`[edward] ${effectiveProvider} error: ${result.error?.slice(0, 300) || '(unknown)'}`);
       return { tasks: [], scorecard: null };
     }
 
-    console.log(`[edward] Raw result preview: ${result.result.slice(0, 300)}...`);
+    console.log(`[edward] Raw result preview: ${result.stdout.slice(0, 300)}...`);
 
-    // Parse — try the new shape first, fall back to the old flat array shape
-    // (kept as a graceful degradation in case Claude regresses to v0.3 format).
-    const parsed = parseAnalysisResult(result.result);
+    // Parse with the balanced-bracket parser from fix/parser-and-clone-auth.
+    // Input is provider-neutralized (invokeLLM returns the final text
+    // regardless of whether claude or codex produced it).
+    const parsed = parseAnalysisResult(result.stdout);
 
-    // Stamp scorecard.generated_at if Claude omitted it
+    // Stamp scorecard.generated_at if the LLM omitted it
     if (parsed.scorecard && !parsed.scorecard.generated_at) {
       parsed.scorecard.generated_at = new Date().toISOString();
     }
-    // Stamp scorecard.provider if Claude omitted it
+    // Stamp scorecard.provider if the LLM omitted it
     if (parsed.scorecard && !parsed.scorecard.provider) {
       parsed.scorecard.provider = ciRaw.provider;
     }
@@ -1176,6 +1252,17 @@ async function handleRequest(req: Request): Promise<Response> {
     const repo = repos.get(discoverMatch[1]);
     if (!repo) return json({ error: 'Repo not found' }, 404);
 
+    // Optional ?provider=claude|codex query param. Reject invalid values
+    // so silent fallback to default doesn't mask a misconfigured client.
+    const providerParam = url.searchParams.get('provider');
+    let provider: Provider | undefined;
+    if (providerParam !== null) {
+      if (!isProvider(providerParam)) {
+        return json({ error: `Invalid provider '${providerParam}'. Valid: claude, codex` }, 400);
+      }
+      provider = providerParam;
+    }
+
     if (discoveryRunning) return json({ tasks: [], count: 0, message: 'Discovery already running' });
     discoveryRunning = true;
 
@@ -1184,8 +1271,12 @@ async function handleRequest(req: Request): Promise<Response> {
     // Run in background — return immediately
     (async () => {
       try {
-        console.log(`[edward] Running agent analysis for ${repo.full_name}${skipProduct ? ' (skip_product)' : ''}...`);
-        const result = await analyzeRepoWithAgent(repo.full_name, { skipProduct });
+        const logOpts = [
+          skipProduct ? 'skip_product' : null,
+          provider ? `provider=${provider}` : null,
+        ].filter(Boolean).join(', ');
+        console.log(`[edward] Running agent analysis for ${repo.full_name}${logOpts ? ` (${logOpts})` : ''}...`);
+        const result = await analyzeRepoWithAgent(repo.full_name, { skipProduct, provider });
 
         // Persist the scorecard onto the repo's settings field (existing
         // extensible Record<string, unknown>, no schema migration needed).
