@@ -476,7 +476,7 @@ ${b}EXAMPLES${r}
 ${b}ENVIRONMENT${r}
   EDWARD_URL    Server URL for CLI commands (default: http://localhost:8080)
   EDWARD_PORT   Port for 'edward serve' (default: 8080)
-  CLAUDE_BIN    Path to claude binary (default: /Users/zhangyiming/.local/bin/claude)
+  CLAUDE_BIN    Path to claude binary (default: auto-detected from PATH)
 
 ${d}A repo argument accepts either 'owner/repo' or a UUID prefix.${r}
 ${d}A task argument accepts a UUID prefix (8 chars is usually enough).${r}

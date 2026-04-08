@@ -208,7 +208,7 @@ async function loadSeedFile(): Promise<void> {
 
 // ── Agent analysis using claude CLI ──
 
-const CLAUDE_BIN = process.env.CLAUDE_BIN || '/Users/zhangyiming/.local/bin/claude';
+const CLAUDE_BIN = process.env.CLAUDE_BIN || Bun.which('claude') || 'claude';
 
 const ANALYSIS_PROMPT = `You are Repo Steward, a senior product engineer doing a pre-incident review of a real production codebase. Your job is to find PRODUCT-LEVEL risks that a smart human reviewer would care about — not just generic code-health nits.
 
