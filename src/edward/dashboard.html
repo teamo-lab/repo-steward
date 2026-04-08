@@ -95,6 +95,8 @@
     border: 1px solid var(--border); cursor: pointer; transition: all 0.15s; }
   .btn-approve { background: var(--green); color: #fff; border-color: var(--green); }
   .btn-approve:hover { opacity: 0.85; }
+  .btn-discuss { background: transparent; color: var(--accent); border-color: var(--accent); }
+  .btn-discuss:hover { background: rgba(88,166,255,0.1); }
   .btn-dismiss { background: transparent; color: var(--red); border-color: var(--red); }
   .btn-dismiss:hover { background: rgba(248,81,73,0.1); }
   .btn-snooze { background: transparent; color: var(--text-muted); }
@@ -124,6 +126,31 @@
     font-size: 14px; box-shadow: 0 8px 24px rgba(0,0,0,0.4);
     transform: translateY(100px); opacity: 0; transition: all 0.3s; z-index: 100; }
   .toast.show { transform: translateY(0); opacity: 1; }
+
+  /* Discuss modal */
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.65);
+    display: flex; align-items: center; justify-content: center; z-index: 200;
+    backdrop-filter: blur(2px); }
+  .modal-backdrop[hidden] { display: none; }
+  .modal { background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 24px; max-width: 600px; width: 90%;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5); }
+  .modal h3 { font-size: 17px; font-weight: 600; margin-bottom: 4px; }
+  .modal .modal-context { font-size: 13px; color: var(--text-muted);
+    margin-bottom: 18px; font-style: italic; word-break: break-word; }
+  .modal label { display: block; font-size: 13px; color: var(--text);
+    margin-bottom: 8px; font-weight: 500; }
+  .modal textarea { width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+    font-family: inherit; font-size: 14px; line-height: 1.5; resize: vertical;
+    min-height: 110px; }
+  .modal textarea:focus { outline: none; border-color: var(--accent); }
+  .modal .modal-hint { font-size: 12px; color: var(--text-muted);
+    margin: 10px 0 18px; }
+  .modal .modal-hint code { background: var(--bg); padding: 1px 6px;
+    border-radius: 4px; font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 11px; border: 1px solid var(--border); }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
 
   /* Confidence bar */
   .conf-bar { width: 80px; height: 6px; background: var(--border); border-radius: 3px;
@@ -209,9 +236,32 @@
 
 <div class="toast" id="toast"></div>
 
+<!-- Discuss modal: collects the user's specific concern before launching claude -->
+<div class="modal-backdrop" id="discuss-modal" hidden onclick="if(event.target===this)closeDiscussModal()">
+  <div class="modal">
+    <h3>Discuss this suggestion</h3>
+    <div class="modal-context" id="discuss-modal-title"></div>
+    <label for="discuss-concern">What's your specific concern or question?</label>
+    <textarea id="discuss-concern" rows="5"
+      placeholder="e.g. The risk level feels too high — the impact section only mentions isolated files, and I'm not convinced this can actually break production…"
+      onkeydown="if(event.key==='Enter'&&(event.metaKey||event.ctrlKey))submitDiscussModal()"></textarea>
+    <div class="modal-hint">
+      This will be handed to a fresh <code>claude</code> session along with the full suggestion
+      context (evidence, impact, verification plan). ⌘/Ctrl+Enter to submit.
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-snooze" onclick="closeDiscussModal()">Cancel</button>
+      <button class="btn btn-discuss" onclick="submitDiscussModal()">Open Discussion</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const API = window.location.origin;
 let currentRepo = null;
+// Task id that the Discuss modal is currently bound to — set by
+// openDiscussModal, consumed by submitDiscussModal, cleared on close.
+let pendingDiscussTaskId = null;
 
 function toast(msg, ms = 3000) {
   const t = document.getElementById('toast');
@@ -361,6 +411,7 @@ function renderTask(task, showActions) {
       ${showActions && status === 'suggested' ? `
         <div class="actions">
           <button class="btn btn-approve" onclick="taskAction('${task.id}', 'approve')">Approve</button>
+          <button class="btn btn-discuss" onclick="openDiscussModal('${task.id}')">Discuss</button>
           <button class="btn btn-dismiss" onclick="taskAction('${task.id}', 'dismiss')">Dismiss</button>
           <button class="btn btn-snooze" onclick="taskAction('${task.id}', 'snooze')">Snooze 24h</button>
         </div>
@@ -424,6 +475,96 @@ async function taskAction(taskId, action) {
   toast(action === 'approve' ? 'Task approved — execution queued' :
         action === 'dismiss' ? 'Task dismissed' : 'Task snoozed for 24h');
   setTimeout(() => loadRepo(), 500);
+}
+
+// ── Discuss flow ──
+//
+// Clicking "Discuss" on a suggestion card does NOT immediately launch
+// claude. It opens a small modal that collects the user's specific
+// concern first — the whole point of the feature is that the user isn't
+// sure about the suggestion and wants to interrogate it. The concern is
+// then POSTed to the server, which weaves it into the seed prompt before
+// spawning the claude CLI (via Terminal.app on macOS, clipboard on other
+// platforms).
+//
+// Flow: openDiscussModal → user types → submitDiscussModal → discussTask
+// → server writes seed.md/launch.sh → osascript (mac) OR clipboard copy.
+//
+// The task card stays in "suggested" status throughout — Discuss is a
+// read-only action. After the chat the user can still Approve / Dismiss
+// / Snooze normally.
+
+function openDiscussModal(taskId) {
+  pendingDiscussTaskId = taskId;
+  const modal = document.getElementById('discuss-modal');
+  const textarea = document.getElementById('discuss-concern');
+  const titleEl = document.getElementById('discuss-modal-title');
+
+  // Surface the task title so the user knows which suggestion they're
+  // about to question — avoids "wait, which card did I click?" confusion.
+  const card = document.querySelector(`[onclick*="openDiscussModal('${taskId}')"]`)?.closest('.task-card');
+  const title = card?.querySelector('.task-title')?.textContent?.trim() || '';
+  titleEl.textContent = title ? '“' + title + '”' : '';
+
+  textarea.value = '';
+  modal.hidden = false;
+  // Let the DOM paint before focusing so the textarea is actually visible.
+  setTimeout(() => textarea.focus(), 0);
+}
+
+function closeDiscussModal() {
+  const modal = document.getElementById('discuss-modal');
+  modal.hidden = true;
+  pendingDiscussTaskId = null;
+}
+
+function submitDiscussModal() {
+  const textarea = document.getElementById('discuss-concern');
+  const concern = textarea.value.trim();
+  if (!concern) {
+    toast('Please describe your concern first');
+    textarea.focus();
+    return;
+  }
+  const taskId = pendingDiscussTaskId;
+  if (!taskId) {
+    toast('Discuss modal has no task bound');
+    return;
+  }
+  closeDiscussModal();
+  discussTask(taskId, concern);
+}
+
+// POSTs { action: 'discuss', concern } to the action endpoint. The server
+// writes the seed + launcher files and either spawns Terminal.app (macOS)
+// or returns a clipboard-mode command for us to copy.
+async function discussTask(taskId, concern) {
+  toast('Preparing discussion…');
+  let data;
+  try {
+    data = await api('/api/v1/tasks/' + taskId + '/action', {
+      method: 'POST', body: JSON.stringify({ action: 'discuss', concern }),
+    });
+  } catch (e) {
+    toast('Discuss failed: ' + e.message);
+    return;
+  }
+  if (data.error) { toast('Discuss failed: ' + data.error); return; }
+
+  if (data.mode === 'terminal') {
+    toast('Opened in Terminal — new chat session starting');
+    return;
+  }
+
+  // Clipboard fallback (non-macOS, or EDWARD_FORCE_CLIPBOARD_DISCUSS=1).
+  if (data.command && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(data.command);
+      toast('Command copied — paste into your terminal');
+      return;
+    } catch { /* fall through to manual show */ }
+  }
+  toast('Run this in a terminal: ' + (data.command || '(no command returned)'), 8000);
 }
 
 async function addRepo() {
