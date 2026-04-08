@@ -16,3 +16,8 @@ sessions/
 # Agent Team workspace — Planner/Generator/Evaluator working files.
 # Per CLAUDE.md, only source code ships; feature artifacts stay local.
 .agent-team/
+
+# Real config for the pr-review-notify skill — contains team chat IDs
+# and Feishu open_ids. The example file is committed; the real one
+# stays local so team data never leaks into the public repo.
+.claude/skills/pr-review-notify/config.json

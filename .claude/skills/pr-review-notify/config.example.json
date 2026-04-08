@@ -1,0 +1,31 @@
+{
+  "_comment": "Copy this to config.json in the same directory and fill in real values. config.json is gitignored so team data never leaks into the repo.",
+
+  "projects": [
+    {
+      "_comment": "Each entry maps a GitHub repo (owner/name) to a Feishu group chat.",
+      "repo": "teamo-lab/repo-steward",
+      "chat_id": "oc_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+      "chat_name": "Teamo Code"
+    },
+    {
+      "repo": "teamo-lab/another-project",
+      "chat_id": "oc_YYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY",
+      "chat_name": "Another Project Dev"
+    }
+  ],
+
+  "members": [
+    {
+      "_comment": "GitHub login → Feishu identity. open_id is the ou_xxx returned by the contact API. display_name is what appears next to the @mention in the chat.",
+      "github": "shufanli",
+      "open_id": "ou_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+      "display_name": "黎书凡"
+    },
+    {
+      "github": "another-user",
+      "open_id": "ou_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+      "display_name": "Another Teammate"
+    }
+  ]
+}
