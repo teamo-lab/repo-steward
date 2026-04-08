@@ -27,6 +27,10 @@
  * `<task>` accepts a UUID prefix (first 8 chars is enough when unambiguous).
  */
 
+import { execSync } from 'node:child_process';
+import { createInterface } from 'node:readline/promises';
+import { resolveClaudeBin, describeAuthEnv } from './server.js';
+
 const DEFAULT_URL = process.env.EDWARD_URL || 'http://localhost:8080';
 
 // ── ANSI helpers ──
@@ -53,6 +57,9 @@ function colorForType(type: string): string {
   if (['error_handling', 'type_safety'].includes(type)) return c.blue;
   if (['test_gap'].includes(type)) return c.green;
   if (['dead_code', 'code_quality'].includes(type)) return c.magenta;
+  // CI audit types (Sprint 1)
+  if (['ci_missing', 'ci_fake', 'ci_insecure'].includes(type)) return c.red;
+  if (['ci_weak', 'ci_governance_gap'].includes(type)) return c.yellow;
   return c.cyan;
 }
 
@@ -81,15 +88,17 @@ interface ParsedArgs {
   until?: string;
   port?: number;
   help: boolean;
+  yes: boolean;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
-  const out: ParsedArgs = { _: [], json: false, url: DEFAULT_URL, wait: false, help: false };
+  const out: ParsedArgs = { _: [], json: false, url: DEFAULT_URL, wait: false, help: false, yes: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === '--json') out.json = true;
     else if (a === '--wait') out.wait = true;
     else if (a === '--help' || a === '-h') out.help = true;
+    else if (a === '--yes' || a === '-y') out.yes = true;
     else if (a === '--url') { out.url = argv[++i] || DEFAULT_URL; }
     else if (a === '--reason') { out.reason = argv[++i]; }
     else if (a === '--until') { out.until = argv[++i]; }
@@ -174,9 +183,123 @@ function padEnd(s: string, n: number): string {
   return s + ' '.repeat(n - stripped.length);
 }
 
+// ── Preflight helpers (first-run auth check) ──
+
+async function promptYesNo(question: string, defaultNo = true): Promise<boolean> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const hint = defaultNo ? ' [y/N] ' : ' [Y/n] ';
+    const ans = (await rl.question(question + hint)).trim().toLowerCase();
+    if (ans === '') return !defaultNo;
+    return ans === 'y' || ans === 'yes';
+  } finally {
+    rl.close();
+  }
+}
+
+/**
+ * Runs before `edward serve` actually binds to a port.
+ *
+ * Catches the two most common first-run mistakes on a fresh clone:
+ *   1. the `claude` CLI isn't installed / not on PATH
+ *   2. a stray ANTHROPIC_API_KEY in the shell rc silently takes over
+ *      from the user's OAuth login without them realizing.
+ *
+ * Returns `true` on success (or user-confirmed proceed), `false` on
+ * abort. Prints all output inline — caller decides the exit code.
+ */
+async function preflightAuth(args: ParsedArgs): Promise<boolean> {
+  // Resolve binary
+  let binPath: string;
+  try {
+    binPath = resolveClaudeBin();
+  } catch (err: any) {
+    console.error(`${c.red}error:${c.reset} ${err.message}`);
+    return false;
+  }
+  console.log(`${c.dim}claude binary:${c.reset} ${binPath}`);
+
+  // Describe auth source
+  const env = describeAuthEnv();
+  if (env.apiKeySet) {
+    console.log(
+      `${c.yellow}⚠${c.reset}  ANTHROPIC_API_KEY detected ${c.dim}(${env.apiKeyPreview})${c.reset}`
+    );
+    for (const line of env.suggestion.split('\n')) {
+      console.log(`   ${c.dim}${line}${c.reset}`);
+    }
+
+    if (args.yes || !process.stdin.isTTY) {
+      console.log(`   ${c.dim}(proceeding — --yes or non-TTY)${c.reset}`);
+      return true;
+    }
+    const go = await promptYesNo('\nContinue with API key billing?', true);
+    if (!go) {
+      console.log(`\n${c.bold}Aborted.${c.reset} To use OAuth instead:`);
+      console.log(`  ${c.bold}unset ANTHROPIC_API_KEY${c.reset}`);
+      console.log(`  ${c.bold}edward serve${c.reset}`);
+      return false;
+    }
+  } else {
+    console.log(`${c.green}✓${c.reset}  OAuth login will be used (no ANTHROPIC_API_KEY set)`);
+  }
+  return true;
+}
+
+async function cmdDoctor(_args: ParsedArgs): Promise<void> {
+  console.log(`${c.bold}edward doctor${c.reset}  ${c.dim}— preflight check${c.reset}\n`);
+
+  // Binary
+  let binPath: string;
+  try {
+    binPath = resolveClaudeBin();
+    console.log(`${c.green}✓${c.reset}  claude binary: ${c.bold}${binPath}${c.reset}`);
+  } catch (err: any) {
+    console.log(`${c.red}✗${c.reset}  claude binary not found`);
+    for (const line of String(err.message).split('\n')) {
+      console.log(`   ${line}`);
+    }
+    process.exit(1);
+  }
+
+  // Version
+  try {
+    const version = execSync(`"${binPath}" --version`, {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5_000,
+    }).toString().trim();
+    if (version) console.log(`   ${c.dim}version: ${version}${c.reset}`);
+  } catch {
+    console.log(`${c.yellow}⚠${c.reset}  could not run \`${binPath} --version\` — binary may be broken`);
+  }
+
+  // Auth
+  console.log();
+  const env = describeAuthEnv();
+  if (env.apiKeySet) {
+    console.log(
+      `${c.yellow}⚠${c.reset}  auth source: ${c.bold}ANTHROPIC_API_KEY${c.reset} ${c.dim}(${env.apiKeyPreview})${c.reset}`
+    );
+  } else {
+    console.log(`${c.green}✓${c.reset}  auth source: ${c.bold}OAuth login (via claude CLI)${c.reset}`);
+  }
+  for (const line of env.suggestion.split('\n')) {
+    console.log(`   ${c.dim}${line}${c.reset}`);
+  }
+
+  console.log();
+  console.log(`Next: ${c.bold}edward serve${c.reset}`);
+}
+
 // ── Commands ──
 
 async function cmdServe(args: ParsedArgs): Promise<void> {
+  // First-run gate: resolve the claude binary and confirm auth source
+  // before binding to a port. Bails early on a fresh clone with a clear
+  // message instead of crashing mid-discovery later.
+  const ok = await preflightAuth(args);
+  if (!ok) process.exit(1);
+
   const { startEdwardServer } = await import('./server.js');
   // Precedence: --port flag > EDWARD_PORT env > default 8080
   const port = args.port || parseInt(process.env.EDWARD_PORT || '8080', 10);
@@ -236,32 +359,118 @@ async function cmdReposAdd(args: ParsedArgs): Promise<void> {
   });
 }
 
-async function cmdDiscover(args: ParsedArgs): Promise<void> {
+// ── CI scorecard helpers ──
+
+interface CIScorecardResponse {
+  scorecard: {
+    overall_score: number;
+    verdict: string;
+    provider: string;
+    generated_at: string;
+    dimensions: Record<string, { score: number; status: string; gaps: string[] }>;
+    top_fixes: Array<{ title: string; effort_min: number; impact: string; why: string }>;
+  } | null;
+  generated_at: string | null;
+}
+
+function colorForCIScore(score: number, status: string): string {
+  if (status === 'unverified' || status === 'na') return c.gray;
+  if (score >= 8) return c.green;
+  if (score >= 5) return c.yellow;
+  return c.red;
+}
+
+function printCIScorecardSummary(sc: CIScorecardResponse['scorecard']): void {
+  if (!sc) {
+    console.log(`${c.dim}CI Health: not generated yet${c.reset}`);
+    return;
+  }
+  const verdictCol =
+    sc.verdict === 'comprehensive' ? c.green :
+    sc.verdict === 'partial' ? c.yellow :
+    c.red;
+  console.log(`${c.bold}CI Health: ${sc.overall_score}/100${c.reset}  ${verdictCol}${sc.verdict}${c.reset}  ${c.dim}(${sc.provider})${c.reset}`);
+
+  // 10 dimensions in two rows of 5 for terminal output
+  const dimKeys = [
+    'presence', 'triggers', 'build_stage', 'test_stage', 'lint_stage',
+    'security_scan', 'branch_protection', 'deployment', 'hygiene', 'docs',
+  ];
+  const cells: string[] = [];
+  for (const key of dimKeys) {
+    const d = sc.dimensions?.[key];
+    if (!d) {
+      cells.push(`${c.gray}${padEnd(key, 12)} -/-${c.reset}`);
+      continue;
+    }
+    const score = typeof d.score === 'number' ? d.score : 0;
+    const col = colorForCIScore(score, d.status);
+    const mark =
+      d.status === 'pass' ? '✓' :
+      d.status === 'partial' ? '⚠' :
+      d.status === 'fail' ? '✗' :
+      '?';
+    // For unverified / na, show "—/—" rather than the meaningless raw 0 score
+    const scoreText = (d.status === 'unverified' || d.status === 'na')
+      ? '  —/—'
+      : `${String(score).padStart(2)}/10`;
+    cells.push(`${col}${mark} ${padEnd(key, 14)} ${scoreText}${c.reset}`);
+  }
+  // Print as two rows of 5
+  for (let i = 0; i < cells.length; i += 5) {
+    console.log('  ' + cells.slice(i, i + 5).join('  '));
+  }
+
+  if (sc.top_fixes && sc.top_fixes.length > 0) {
+    console.log();
+    console.log(`${c.dim}Top fixes:${c.reset}`);
+    for (let i = 0; i < Math.min(sc.top_fixes.length, 3); i++) {
+      const f = sc.top_fixes[i]!;
+      const impactCol = f.impact === 'high' ? c.red : f.impact === 'medium' ? c.yellow : c.gray;
+      console.log(`  ${i + 1}. ${c.bold}${f.title}${c.reset}  ${c.dim}(~${f.effort_min} min, ${impactCol}${f.impact}${c.reset}${c.dim} impact)${c.reset}`);
+    }
+  }
+}
+
+async function fetchScorecard(url: string, repoId: string): Promise<CIScorecardResponse['scorecard']> {
+  try {
+    const data = await api<CIScorecardResponse>(url, `/api/v1/repos/${repoId}/ci-scorecard`);
+    return data.scorecard;
+  } catch {
+    return null;
+  }
+}
+
+// ── Discover / ci-audit shared body ──
+
+async function runDiscoverFlow(args: ParsedArgs, opts: { skipProduct: boolean }): Promise<void> {
   const query = args._[1];
-  if (!query) throw new Error('Usage: edward discover <owner/repo> [--wait]');
+  const verb = opts.skipProduct ? 'ci-audit' : 'discover';
+  if (!query) throw new Error(`Usage: edward ${verb} <owner/repo> [--wait]`);
   const repo = await resolveRepo(args.url, query);
 
-  console.log(`${c.dim}Triggering discovery for ${repo.full_name}...${c.reset}`);
+  console.log(`${c.dim}Triggering ${verb} for ${repo.full_name}...${c.reset}`);
+  const url = opts.skipProduct
+    ? `/api/v1/repos/${repo.id}/discover?skip_product=1`
+    : `/api/v1/repos/${repo.id}/discover`;
   const start = await api<{ message: string }>(
     args.url,
-    `/api/v1/repos/${repo.id}/discover`,
+    url,
     { method: 'POST' }
   );
 
   if (!args.wait) {
     console.log(`${c.green}✓${c.reset} ${start.message}`);
-    console.log(`\nPoll status:  ${c.bold}edward discover ${repo.full_name} --wait${c.reset}`);
-    console.log(`Or check now: ${c.bold}edward suggestions ${repo.full_name}${c.reset}`);
+    console.log(`\nPoll status:  ${c.bold}edward ${verb} ${repo.full_name} --wait${c.reset}`);
     return;
   }
 
-  // Wait for completion — poll every 15s, show a simple spinner
+  // Wait for completion — poll every 10s, show a spinner
   const spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
   let frame = 0;
   const t0 = Date.now();
   let lastCount = 0;
 
-  // Spinner tick every 150ms
   const tick = setInterval(() => {
     if (!tty) return;
     const elapsed = Math.floor((Date.now() - t0) / 1000);
@@ -288,10 +497,24 @@ async function cmdDiscover(args: ParsedArgs): Promise<void> {
   }
 
   const elapsed = Math.floor((Date.now() - t0) / 1000);
-  console.log(`${c.green}✓${c.reset} Discovery complete in ${elapsed}s — ${lastCount} tasks`);
+  console.log(`${c.green}✓${c.reset} ${verb === 'ci-audit' ? 'CI audit' : 'Discovery'} complete in ${elapsed}s — ${lastCount} tasks`);
   console.log();
-  // Show suggestions immediately
+
+  // Show suggestions (skip if ci-audit and no findings — scorecard already covers it)
   await cmdSuggestions({ ...args, _: ['suggestions', query] });
+
+  // Append CI scorecard summary (always — printCIScorecardSummary handles null)
+  const sc = await fetchScorecard(args.url, repo.id);
+  console.log();
+  printCIScorecardSummary(sc);
+}
+
+async function cmdDiscover(args: ParsedArgs): Promise<void> {
+  await runDiscoverFlow(args, { skipProduct: false });
+}
+
+async function cmdCiAudit(args: ParsedArgs): Promise<void> {
+  await runDiscoverFlow(args, { skipProduct: true });
 }
 
 async function cmdSuggestions(args: ParsedArgs): Promise<void> {
@@ -438,12 +661,14 @@ ${b}USAGE${r}
   edward <command> [args] [flags]
 
 ${b}COMMANDS${r}
-  ${b}serve${r} [--port N]                  Start the dashboard server (default port 8080)
+  ${b}serve${r} [--port N] [--yes]         Start the dashboard server (default port 8080)
+  ${b}doctor${r}                            Preflight: locate claude CLI + check auth source
 
   ${b}repos${r}                            List tracked repos
   ${b}repos add${r} owner/repo             Add a repo (fetches GitHub metadata)
 
   ${b}discover${r} <repo> [--wait]         Trigger agent analysis (async unless --wait)
+  ${b}ci-audit${r} <repo> [--wait]         CI completeness audit only (faster, no product bug scan)
   ${b}suggestions${r} <repo>               Top 10 open suggestions for a repo
   ${b}tasks${r} <repo>                     All tasks (any status)
   ${b}stats${r} <repo>                     Acceptance rate, merge rate, counts
@@ -460,6 +685,7 @@ ${b}FLAGS${r}
   --url URL                        Override EDWARD_URL (default http://localhost:8080)
   --port N, -p N                   Port for 'edward serve' (default 8080)
   --wait                           Block until discovery finishes (for discover)
+  --yes, -y                        Skip interactive confirmation (for serve)
   --reason "..."                   Reason for dismiss
   --until ISO                      ISO timestamp for snooze
 
@@ -474,9 +700,11 @@ ${b}EXAMPLES${r}
   edward tasks teamo-lab/clawschool --json | jq '.[] | select(.risk_level=="high")'
 
 ${b}ENVIRONMENT${r}
-  EDWARD_URL    Server URL for CLI commands (default: http://localhost:8080)
-  EDWARD_PORT   Port for 'edward serve' (default: 8080)
-  CLAUDE_BIN    Path to claude binary (default: auto-detected from PATH)
+  EDWARD_URL         Server URL for CLI commands (default: http://localhost:8080)
+  EDWARD_PORT        Port for 'edward serve' (default: 8080)
+  CLAUDE_BIN         Override auto-detection of the \`claude\` CLI binary
+  ANTHROPIC_API_KEY  If set, analysis runs bill to that API account instead
+                     of your OAuth login. Edward warns + prompts on serve.
 
 ${d}A repo argument accepts either 'owner/repo' or a UUID prefix.${r}
 ${d}A task argument accepts a UUID prefix (8 chars is usually enough).${r}
@@ -501,6 +729,10 @@ export async function runCli(argv: string[]): Promise<number> {
         await cmdServe(args);
         return 0;
 
+      case 'doctor':
+        await cmdDoctor(args);
+        return 0;
+
       case 'version':
       case '--version':
       case '-v':
@@ -514,6 +746,11 @@ export async function runCli(argv: string[]): Promise<number> {
 
       case 'discover':
         await cmdDiscover(args);
+        return 0;
+
+      case 'ci-audit':
+      case 'ci_audit':
+        await cmdCiAudit(args);
         return 0;
 
       case 'suggestions':
