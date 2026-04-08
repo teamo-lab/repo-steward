@@ -477,50 +477,6 @@ For EACH functional finding, you must show:
 - What the user would experience when it triggers
 
 ══════════════════════════════════════
-PHASE 1 — UNDERSTAND THE PRODUCT (mandatory, do this first)
-══════════════════════════════════════
-Before suggesting anything, you MUST:
-1. Read README.md / README.* / docs/ to learn what this product actually does
-2. Identify the top 3-5 user-facing features (sign-up, login, payment, upload, deployment, search, etc.)
-3. Find the entry points for those features (HTTP routes, CLI commands, API endpoints, UI handlers)
-4. Trace at least one critical flow end-to-end from user input → response
-
-If there is no README, use directory structure + main entry files to infer the product.
-
-══════════════════════════════════════
-PHASE 2 — FUNCTIONAL BUG HUNT (priority — most valuable findings)
-══════════════════════════════════════
-For each critical user flow, look for issues that would cause REAL USER PAIN:
-
-A. **Flow breaks**: Code paths where the happy path works but a realistic edge case silently fails
-   - Example: file upload endpoint that doesn't validate MIME type → corrupted user files
-   - Example: payment retry logic that double-charges on network blip
-   - Example: registration form that accepts duplicate emails because the unique check is on a different field
-
-B. **State / data integrity bugs**: Race conditions, missing transactions, off-by-one in pagination, stale cache
-   - Example: token refresh that has TOCTOU between check-expired and use
-   - Example: counter increment without atomic update → lost updates under load
-
-C. **User-visible failure modes**: Where errors leak to the user, where loading states never end, where retries go forever
-   - Example: 500 with stack trace shown to user
-   - Example: form submit button stays disabled after API error
-   - Example: silent failure when external API returns 200 with error in body
-
-D. **Compatibility / deployment risks**: Installation paths that fail on real user environments
-   - Example: skill installer assumes Linux paths but spec says cross-platform
-   - Example: download URL hardcoded to a CDN that gets rate-limited
-   - Example: config file expected at one path but written to another
-
-E. **Behavior contradicting docs**: Where README/docs promise X but the code does Y
-   - Example: doc says "auto-saves every 30s" but timer is 60s
-   - Example: CLI flag documented but not actually parsed
-
-For EACH functional finding, you must show:
-- The actual user-facing symptom (not "bad code")
-- The specific code location that causes it
-- What the user would experience when it triggers
-
-══════════════════════════════════════
 PHASE 3 — CODE HEALTH (secondary — only if highly impactful)
 ══════════════════════════════════════
 After functional bugs, optionally include code-health issues — but ONLY ones with real consequences:
