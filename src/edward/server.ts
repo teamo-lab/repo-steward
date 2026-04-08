@@ -1189,8 +1189,44 @@ interface ParsedAnalysis {
  *
  * Never throws.
  */
+/**
+ * Strip trailing prose from a JSON response. Walks from the last `}`
+ * backwards looking for a depth-zero match to an earlier `{` such that
+ * the slice in between is itself valid JSON. Used as an Attempt 2.5
+ * between the "direct parse" and "greedy [...]" strategies.
+ *
+ * Returns null if no parseable {...} prefix is found.
+ */
+function stripTrailingProseAndParse(text: string): any | null {
+  // Try progressively earlier `}` positions. Cheap and bounded: most
+  // malformed responses only need one or two retries.
+  let searchEnd = text.length;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const lastClose = text.lastIndexOf('}', searchEnd - 1);
+    if (lastClose < 0) return null;
+    const firstOpen = text.indexOf('{');
+    if (firstOpen < 0 || firstOpen >= lastClose) return null;
+    const slice = text.slice(firstOpen, lastClose + 1);
+    try {
+      return JSON.parse(slice);
+    } catch {
+      searchEnd = lastClose;
+    }
+  }
+  return null;
+}
+
 function parseAnalysisResult(text: string): ParsedAnalysis {
   const empty: ParsedAnalysis = { ci_findings: [], phase_1_2_3_findings: [], scorecard: null };
+
+  // Always dump the raw text so post-mortem doesn't require re-running
+  // the (expensive) discover. Cheap: it's a few hundred KB at most, and
+  // each run gets its own file. Useful regardless of parse success.
+  try {
+    const dumpPath = `/tmp/edward-raw-analysis-${Date.now()}.txt`;
+    writeFileSync(dumpPath, text, 'utf-8');
+    console.log(`[edward] Raw LLM output dumped to ${dumpPath} (${text.length} bytes)`);
+  } catch { /* best effort */ }
 
   const tryShape = (parsed: any): ParsedAnalysis | null => {
     if (!parsed) return null;
@@ -1218,8 +1254,23 @@ function parseAnalysisResult(text: string): ParsedAnalysis {
       // object would be silently dropped).
       return null;
     }
-    // Legacy flat array of tasks
+    // Legacy flat array of tasks — STRICT: every element must look like
+    // a task object (has .title and is an object). This prevents a very
+    // nasty failure mode we hit on ama-user-service:
+    //   Attempt 1 failed (malformed outer JSON)
+    //   Attempt 2 failed (same slice, still malformed)
+    //   Attempt 3 grabbed the FIRST `[...]` slice, which turned out to
+    //     be `ci_scorecard.dimensions.presence.evidence`: an array of
+    //     strings describing CI files. JSON.parse succeeded because
+    //     a string array is valid JSON; tryShape saw Array.isArray →
+    //     returned them as phase_1_2_3_findings. Downstream
+    //     toEdwardTask rejected all of them (no .title) → 0 tasks
+    //     saved, scorecard=no, and the user lost a 14-minute $1.45 run.
     if (Array.isArray(parsed)) {
+      const looksLikeTasks = parsed.length > 0 && parsed.every(
+        t => t && typeof t === 'object' && typeof t.title === 'string'
+      );
+      if (!looksLikeTasks) return null;
       return { ci_findings: [], phase_1_2_3_findings: parsed, scorecard: null };
     }
     return null;
@@ -1240,6 +1291,21 @@ function parseAnalysisResult(text: string): ParsedAnalysis {
       const shaped = tryShape(parsed);
       if (shaped) return shaped;
     } catch { /* try next */ }
+  }
+
+  // Attempt 2.5: strip trailing prose. If the LLM added a postscript
+  // after the JSON body (e.g. "Note: this analysis took 80 turns."),
+  // both Attempt 1 (trailing text) and Attempt 2 (still parses because
+  // findFirstBalancedJson returns the full outer slice which is valid)
+  // should have already succeeded. This attempt is for the OTHER
+  // failure mode: the outer {...} IS malformed JSON (missing comma,
+  // unescaped quote, trailing comma) but a strict PREFIX of it is
+  // valid. Walk back from the last `}` to find the longest parseable
+  // prefix.
+  const prefixParsed = stripTrailingProseAndParse(text);
+  if (prefixParsed) {
+    const shaped = tryShape(prefixParsed);
+    if (shaped) return shaped;
   }
 
   // Attempt 3: first balanced [...] array (legacy v0.3 shape)
