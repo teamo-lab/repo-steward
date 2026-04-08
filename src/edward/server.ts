@@ -208,104 +208,7 @@ async function loadSeedFile(): Promise<void> {
 
 // ── Agent analysis using claude CLI ──
 
-// Resolve the `claude` CLI binary path.
-//
-// Precedence:
-//   1. CLAUDE_BIN env var (explicit override)
-//   2. `command -v claude` on the user's PATH
-//   3. Common install locations (homebrew, /usr/local, ~/.local, ~/.bun)
-//
-// Throws a friendly error if none succeed. Callers should catch and
-// surface the message — this is the single most common first-run
-// failure on a fresh clone.
-let cachedClaudeBin: string | null = null;
-
-export function resolveClaudeBin(): string {
-  if (cachedClaudeBin) return cachedClaudeBin;
-
-  if (process.env.CLAUDE_BIN) {
-    if (!existsSync(process.env.CLAUDE_BIN)) {
-      throw new Error(
-        `CLAUDE_BIN=${process.env.CLAUDE_BIN} is set but that file does not exist.\n` +
-        `       Unset it or point it at a real \`claude\` binary.`
-      );
-    }
-    cachedClaudeBin = process.env.CLAUDE_BIN;
-    return cachedClaudeBin;
-  }
-
-  // `command -v` resolves PATH lookups without sourcing the user's interactive rc files.
-  try {
-    const out = execSync('command -v claude 2>/dev/null', {
-      shell: '/bin/sh',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).toString().trim();
-    if (out && existsSync(out)) {
-      cachedClaudeBin = out;
-      return cachedClaudeBin;
-    }
-  } catch {}
-
-  const home = process.env.HOME || '';
-  const candidates = [
-    '/opt/homebrew/bin/claude',
-    '/usr/local/bin/claude',
-    `${home}/.local/bin/claude`,
-    `${home}/.bun/bin/claude`,
-    `${home}/.npm-global/bin/claude`,
-  ];
-  for (const p of candidates) {
-    if (existsSync(p)) {
-      cachedClaudeBin = p;
-      return cachedClaudeBin;
-    }
-  }
-
-  throw new Error(
-    `Could not find the \`claude\` CLI binary on your PATH.\n` +
-    `       Install it and run \`claude\` once to log in, then retry.\n` +
-    `       Or set CLAUDE_BIN=/full/path/to/claude if it lives somewhere unusual.`
-  );
-}
-
-export interface AuthEnvStatus {
-  apiKeySet: boolean;
-  apiKeyPreview: string | null;
-  suggestion: string;
-}
-
-/**
- * Describes which auth source the `claude` subprocess will end up using.
- *
- * We only inspect ANTHROPIC_API_KEY. OAuth detection lives inside the
- * `claude` binary itself — Keychain / ~/.claude/.credentials.json paths
- * are cross-platform hostile and not our business. The one thing a user
- * can accidentally leave wrong is a stray ANTHROPIC_API_KEY export in
- * their shell rc file, and that's exactly what this check catches.
- */
-export function describeAuthEnv(): AuthEnvStatus {
-  const key = process.env.ANTHROPIC_API_KEY;
-  if (key) {
-    return {
-      apiKeySet: true,
-      apiKeyPreview: key.slice(0, 12) + '…',
-      suggestion:
-        'ANTHROPIC_API_KEY is set. The `claude` subprocess will bill\n' +
-        'analysis runs to that API account and IGNORE any OAuth login\n' +
-        'you configured. To use your OAuth login instead:\n' +
-        '  unset ANTHROPIC_API_KEY\n' +
-        'then relaunch `edward serve`.',
-    };
-  }
-  return {
-    apiKeySet: false,
-    apiKeyPreview: null,
-    suggestion:
-      'No ANTHROPIC_API_KEY in environment — the `claude` subprocess\n' +
-      'will use its stored OAuth credentials. If you have not logged\n' +
-      'in yet, run `claude` once interactively to complete login.',
-  };
-}
+const CLAUDE_BIN = process.env.CLAUDE_BIN || '/Users/zhangyiming/.local/bin/claude';
 
 const ANALYSIS_PROMPT = `You are Repo Steward, a senior product engineer doing a pre-incident review of a real production codebase. Your job is to find PRODUCT-LEVEL risks that a smart human reviewer would care about — not just generic code-health nits.
 
@@ -417,17 +320,8 @@ async function analyzeRepoWithAgent(fullName: string): Promise<EdwardTask[]> {
     delete env.CLAUDECODE;
     delete env.CLAUDE_CODE_ENTRYPOINT;
 
-    // Resolve the binary per-call; the result is cached after first success.
-    let binPath: string;
-    try {
-      binPath = resolveClaudeBin();
-    } catch (err: any) {
-      console.error(`[edward] ${err.message}`);
-      return [];
-    }
-
     const stdout = await new Promise<string>((resolve, reject) => {
-      const proc = spawn(binPath, [
+      const proc = spawn(CLAUDE_BIN, [
         '-p', ANALYSIS_PROMPT,
         '--output-format', 'json',
         '--dangerously-skip-permissions',
