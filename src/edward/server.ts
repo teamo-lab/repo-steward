@@ -16,6 +16,10 @@ import {
   loadRepoMemory, recordDismissal, recordAnswer, fingerprintFor,
 } from './repo_memory.js';
 import { invokeLLMWithFallback, isProvider, type Provider } from './llm_provider.js';
+import { loadBusinessContext, contextIsActionable, type BusinessContext } from './business_context.js';
+import { enumerateFeatures, type FeatureSurface } from './feature_inventory.js';
+import { mapFeaturesToTests, type TestCoverageMap } from './test_mapping.js';
+import { runFunctionalCIAnalysis, synthesizedTestToTaskFields } from './functional_ci.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DASHBOARD_HTML_PATH = join(__dirname, 'dashboard.html');
@@ -849,6 +853,27 @@ function findFirstBalancedJson(text: string, open: '{' | '['): string | null {
  * Convert a raw task object from the LLM output into an EdwardTask.
  * Defensive — every field has a default, never throws on weird shapes.
  */
+/**
+ * Infrastructure-type findings that Edward demotes to low-risk /
+ * non-primary display because feedback from real project owners said
+ * they're "politically correct but not where CI value is". Kept as
+ * scorecard signal, but never promoted to high-risk suggestions.
+ *
+ * This is the "Layer 1 demotion" part of the Functional-CI sprint:
+ * users care about functional test gaps, not whether dependabot.yml
+ * exists. Infra findings still appear, just down-ranked.
+ */
+const INFRASTRUCTURE_TYPES = new Set([
+  'ci_missing',
+  'ci_weak',
+  'ci_governance_gap',
+  'ci_fake',  // placeholder / no-op CI gates
+]);
+
+function isInfrastructureType(type: string): boolean {
+  return INFRASTRUCTURE_TYPES.has(type);
+}
+
 function toEdwardTask(t: any): EdwardTask | null {
   if (!t || typeof t !== 'object' || !t.title) return null;
   // Confidence threshold raised from 0.65 to 0.7 to cut the "edge"
@@ -856,19 +881,27 @@ function toEdwardTask(t: any): EdwardTask | null {
   // main source of run-to-run variance).
   if (typeof t.confidence !== 'number' || t.confidence < 0.7) return null;
 
+  const rawType = String(t.type || 'code_quality');
+  // Functional CI demotion: generic CI hygiene findings ("no
+  // dependabot", "no codeowners file", "lint not enforcing", etc.)
+  // are forced to low risk. They still surface in the scorecard but
+  // don't clutter the primary suggestions feed.
+  const isInfra = isInfrastructureType(rawType);
+  const risk = isInfra ? 'low' : (t.riskLevel || 'low');
+
   return {
     id: uuid(),
     repo_id: '',
     signal_ids: [],
-    type: t.type || 'code_quality',
+    type: rawType,
     status: 'suggested',
     title: String(t.title),
     description: String(t.description || '') + (t.userImpact ? `\n\n**User impact:** ${t.userImpact}` : ''),
-    evidence: { ...(t.evidence || { signals: [] }), userImpact: t.userImpact },
+    evidence: { ...(t.evidence || { signals: [] }), userImpact: t.userImpact, infra_demoted: isInfra || undefined },
     impact: t.impact || { estimatedFiles: [], estimatedLinesChanged: 0, blastRadius: 'isolated' },
     verification: t.verification || { method: 'Tests pass', steps: [], successCriteria: [] },
     confidence: Math.min(1, Math.max(0, t.confidence)),
-    risk_level: t.riskLevel || 'low',
+    risk_level: risk,
     suggested_at: new Date().toISOString(),
     approved_at: null,
     completed_at: null,
@@ -923,6 +956,39 @@ async function analyzeRepoWithAgent(
     } else {
       console.log(`[edward] hot modules: none (no git history or coverage data)`);
     }
+
+    // Functional-CI Layer 3: load business context (`.edward/context.yml`
+    // or auto-extract from README/OpenAPI). If we can't build an
+    // actionable context, the functional CI phase will short-circuit
+    // and we fall back to the existing Phase 0 / 1-3 outputs.
+    const businessContext: BusinessContext = await loadBusinessContext(
+      `${tmpDir}/repo`,
+      {
+        provider: effectiveProvider,
+        allowAutoExtract: !opts?.skipProduct,
+      }
+    );
+    console.log(
+      `[edward] business context: source=${businessContext.source} ` +
+      `project="${businessContext.project.name || '(unnamed)'}" ` +
+      `flows=${businessContext.critical_flows.length} ` +
+      `invariants=${businessContext.critical_flows.reduce((a, f) => a + f.invariants.length, 0)}`
+    );
+
+    // Functional-CI Layer 4: enumerate features + map to existing tests.
+    // Cheap (pure regex + fs walk), runs regardless of whether the
+    // downstream LLM phases execute.
+    const featureSurface: FeatureSurface = enumerateFeatures(`${tmpDir}/repo`, profile);
+    const testCoverage: TestCoverageMap = mapFeaturesToTests(`${tmpDir}/repo`, featureSurface);
+    console.log(
+      `[edward] feature surface: endpoints=${featureSurface.endpoints.length} ` +
+      `llm_calls=${featureSurface.llm_calls.length} ` +
+      `cron=${featureSurface.cron_jobs.length} ` +
+      `queue=${featureSurface.queue_consumers.length}`
+    );
+    console.log(
+      `[edward] test mapping: ${testCoverage.summary.features_with_any_test}/${testCoverage.summary.total_features} features have some test coverage`
+    );
 
     // Dispatch through the provider abstraction. invokeLLMWithFallback
     // handles binary resolution, spawn, env scrubbing, error capture,
@@ -986,12 +1052,50 @@ async function analyzeRepoWithAgent(
     const wantPhase0 = true;
     const wantPhase123 = !opts?.skipProduct;
 
+    // Functional CI phase runs alongside the others whenever we have an
+    // actionable business context. Always skipped on `ci-audit` / skipProduct
+    // runs to keep that flag's semantics clean — ci-audit is scorecard-only.
+    const wantFunctionalCI =
+      !opts?.skipProduct && contextIsActionable(businessContext);
+
     const phases: Promise<PhaseResult>[] = [];
     if (wantPhase0) phases.push(runPhase('phase0'));
     if (wantPhase123) phases.push(runPhase('phase123'));
 
-    console.log(`[edward] Running ${phases.length} parallel LLM ${phases.length === 1 ? 'call' : 'calls'} (phase0=${wantPhase0}, phase123=${wantPhase123})`);
+    // Kick off the Functional CI analysis in parallel. It runs its
+    // own LLM calls (invokeLLMWithFallback) inside runFunctionalCIAnalysis,
+    // so it respects the same fallback semantics as the other phases.
+    // Result is awaited below in Promise.allSettled so a failing
+    // functional CI run doesn't take down Phase 0 / 1-3.
+    const functionalCIPromise = wantFunctionalCI
+      ? runFunctionalCIAnalysis(
+          `${tmpDir}/repo`,
+          businessContext,
+          featureSurface,
+          testCoverage,
+          {
+            provider: effectiveProvider,
+            allowFallback,
+            preferredExt: detectPreferredTestExt(profile),
+          }
+        )
+      : null;
+
+    console.log(
+      `[edward] Running ${phases.length} parallel LLM ${phases.length === 1 ? 'call' : 'calls'} (phase0=${wantPhase0}, phase123=${wantPhase123}, functional_ci=${wantFunctionalCI})`
+    );
     const phaseResults = await Promise.all(phases);
+    const functionalCIResult = functionalCIPromise ? await functionalCIPromise : null;
+    if (functionalCIResult) {
+      const d = functionalCIResult.diagnostics;
+      console.log(
+        `[edward] functional-ci: invariants=${d.invariants_total} ` +
+        `covered=${d.invariants_covered} uncovered=${d.invariants_uncovered} ` +
+        `synth=${functionalCIResult.synthesized.length} ` +
+        `cost=$${(d.phase_a_cost_usd + d.phase_b_cost_usd).toFixed(2)} ` +
+        `${functionalCIResult.error ? `error=${functionalCIResult.error}` : ''}`
+      );
+    }
 
     let totalCost = 0;
     let combinedParsed: ParsedAnalysis = { ci_findings: [], phase_1_2_3_findings: [], scorecard: null, open_questions: [] };
@@ -1154,6 +1258,21 @@ async function analyzeRepoWithAgent(
       }
     }
 
+    // Prepend Functional CI findings AS PRIMARY tasks — these are the
+    // user-visible "Feature Test Gap" entries that the functional-ci
+    // sprint was designed to produce. Each synthesized test becomes a
+    // missing_functional_test task with embedded code. They come
+    // BEFORE existing CI findings so the dashboard surfaces them first.
+    const functionalCITasks: EdwardTask[] = [];
+    if (functionalCIResult && functionalCIResult.synthesized.length > 0) {
+      for (const s of functionalCIResult.synthesized) {
+        const fields = synthesizedTestToTaskFields(s);
+        const task = toEdwardTask(fields);
+        if (task) functionalCITasks.push(task);
+      }
+    }
+    const allTasks = [...functionalCITasks, ...tasks];
+
     // Normalize open_questions: drop anything malformed, cap at 3,
     // slice strings to sane lengths. This runs in-process so we can
     // trust the shape when wiring downstream state.
@@ -1169,17 +1288,40 @@ async function analyzeRepoWithAgent(
 
     const scanId = uuid();
     console.log(
-      `[edward] Parsed ${tasks.length} tasks (${parsed.ci_findings.length} CI + ${parsed.phase_1_2_3_findings.length} product), ` +
+      `[edward] Parsed ${allTasks.length} tasks ` +
+      `(${functionalCITasks.length} functional_ci + ${parsed.ci_findings.length} CI + ${parsed.phase_1_2_3_findings.length} product), ` +
       `scorecard=${parsed.scorecard ? 'yes' : 'no'}, open_questions=${normalizedOpenQuestions.length}`
     );
 
-    return { tasks, scorecard: parsed.scorecard, open_questions: normalizedOpenQuestions, scan_id: scanId };
+    return { tasks: allTasks, scorecard: parsed.scorecard, open_questions: normalizedOpenQuestions, scan_id: scanId };
   } catch (err: any) {
     console.error(`[edward] Agent analysis failed: ${err.message}`);
     return { tasks: [], scorecard: null, open_questions: [], scan_id: uuid() };
   } finally {
     try { execSync(`rm -rf ${tmpDir}`, { stdio: 'pipe' }); } catch {}
   }
+}
+
+/**
+ * Pick the extension we want the Test Synthesis LLM call to match when
+ * generating new tests. Biases toward the repo's dominant stack so a
+ * Python project doesn't get JS tests.
+ */
+function detectPreferredTestExt(profile: RepoProfile): string | undefined {
+  for (const stack of profile.stacks) {
+    const s = stack.toLowerCase();
+    if (s === 'python') return 'py';
+    if (s === 'typescript') return 'ts';
+    if (s === 'javascript') return 'js';
+    if (s === 'go' || s === 'golang') return 'go';
+    if (s === 'rust') return 'rs';
+    if (s === 'java') return 'java';
+    if (s === 'kotlin') return 'kt';
+    if (s === 'ruby') return 'rb';
+    if (s === 'php') return 'php';
+    if (s === 'csharp' || s === 'c#') return 'cs';
+  }
+  return undefined;
 }
 
 // ── Discuss action: spin up an ad-hoc claude CLI chat seeded with the task ──

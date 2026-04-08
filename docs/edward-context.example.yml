@@ -1,0 +1,95 @@
+# Example .edward/context.yml
+#
+# Copy this to .edward/context.yml in your own repo and edit to describe
+# your project's business behavior. Edward uses it to generate missing
+# functional test suggestions — specific tests it thinks your CI should
+# have, based on the business rules you declare here.
+#
+# All fields are optional. Missing fields fall back to auto-extract
+# from README/OpenAPI (lower precision) or get skipped entirely.
+#
+# Schema:
+#   project.{name,domain,summary}      — one-line and paragraph product descriptions
+#   critical_flows[]                   — discrete user-facing features
+#     .id                              — stable slug, [a-z_][a-z0-9_]*
+#     .name                            — human-readable
+#     .entry_points[]                  — code locations (paths, modules, routes)
+#     .invariants[]                    — business rules CI should verify
+#       .id                            — stable slug
+#       .description                   — one-sentence rule
+#       .severity                      — low | medium | high
+#   model_contracts[]                  — constraints on LLM / external API usage
+#     .library                         — e.g. openai, anthropic, stripe
+#     .allowed_models                  — enumerated whitelist
+#     .param_ranges.{param}            — [min, max] numeric ranges
+#   forbidden[]                        — explicit "must never happen" rules
+
+project:
+  name: example-app
+  domain: "SaaS chat backend with multi-provider LLM routing"
+  summary: >
+    Multi-tenant chat API that routes user messages across OpenAI,
+    Anthropic, and DeepSeek models. Per-tenant rate limits, daily
+    usage quotas, and banned-user routing.
+
+critical_flows:
+  - id: user_signup
+    name: "User signup via SMS verification"
+    entry_points:
+      - app/routes/signup.py
+      - app/auth/sms.py
+    invariants:
+      - id: code_ttl
+        description: "SMS verification code expires after exactly 5 minutes"
+        severity: high
+      - id: rate_limit
+        description: "Same phone number cannot request more than one SMS per 60 seconds"
+        severity: high
+      - id: phone_format
+        description: "Phone must be E.164 format, country code required"
+        severity: medium
+
+  - id: chat_send
+    name: "Send chat message to model"
+    entry_points:
+      - app/routes/chat.py
+    invariants:
+      - id: banned_user_downgrade
+        description: "Banned users are automatically routed to the cheap fallback model"
+        severity: high
+      - id: quota_check_atomic
+        description: "Per-user daily quota decrement must be atomic across redis and mongodb"
+        severity: high
+      - id: streaming_timeout
+        description: "Server-side streaming connections close after 30 seconds of no model output"
+        severity: medium
+
+  - id: payment_intent
+    name: "Create payment intent"
+    entry_points:
+      - app/routes/pay.py
+    invariants:
+      - id: amount_positive
+        description: "Charge amount must be >= 0.01 (smallest unit)"
+        severity: high
+      - id: idempotency_key_required
+        description: "Every request must include a unique idempotency key"
+        severity: high
+
+model_contracts:
+  - library: openai
+    allowed_models: [gpt-4, gpt-4o, gpt-4o-mini, o1, o1-mini]
+    param_ranges:
+      temperature: [0.0, 2.0]
+      max_tokens: [1, 16384]
+
+  - library: anthropic
+    allowed_models: [claude-3-5-sonnet-latest, claude-3-5-haiku-latest]
+    param_ranges:
+      temperature: [0.0, 1.0]
+      max_tokens: [1, 8192]
+
+forbidden:
+  - "hardcoded API keys or webhook URLs in any committed file"
+  - "calls to os.system() or shell=True in subprocess anywhere in the request path"
+  - "logging full LLM prompts or responses (PII leakage)"
