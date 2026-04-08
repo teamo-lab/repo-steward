@@ -5,7 +5,7 @@
  * Uses Bun's native HTTP server (no Fastify needed in the edward build).
  */
 
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, execSync } from 'node:child_process';
@@ -404,6 +404,164 @@ async function analyzeRepoWithAgent(fullName: string): Promise<EdwardTask[]> {
   }
 }
 
+// ── Discuss action: spin up an ad-hoc claude CLI chat seeded with the task ──
+//
+// The original analysis session is non-resumable (analyzeRepoWithAgent passes
+// --no-session-persistence), so "discuss" does NOT resume a session — it
+// seeds a brand new claude CLI process with a fully-formed prompt built
+// from the task + repo metadata. On macOS we drive Terminal.app via
+// osascript so the user gets a one-click experience. On other platforms
+// (or when EDWARD_FORCE_CLIPBOARD_DISCUSS=1 is set for testing) we skip
+// the spawn and let the dashboard copy the launch command to the clipboard.
+
+const CHAT_DIR_ROOT = '/tmp/edward-chats';
+
+function buildDiscussSeed(repo: EdwardRepo, task: EdwardTask, concern?: string): string {
+  const impact = task.impact as Record<string, unknown>;
+  const ver = task.verification as Record<string, unknown>;
+
+  const evidence = Object.keys(task.evidence || {}).length > 0
+    ? JSON.stringify(task.evidence, null, 2)
+    : '(none collected)';
+
+  const filesArr = (impact?.estimatedFiles as string[] | undefined) || [];
+  const files = filesArr.length > 0 ? filesArr.join(', ') : '(unspecified)';
+  const lines = impact?.estimatedLinesChanged ?? '(unspecified)';
+  const blast = impact?.blastRadius || '(unspecified)';
+
+  const method = ver?.method || '(unspecified)';
+  const stepsArr = (ver?.steps as string[] | undefined) || [];
+  const steps = stepsArr.length > 0
+    ? stepsArr.map((s: string, i: number) => `  ${i + 1}. ${s}`).join('\n')
+    : '  (none)';
+  const successArr = (ver?.successCriteria as string[] | undefined) || [];
+  const success = successArr.length > 0
+    ? successArr.map((s: string) => `  - ${s}`).join('\n')
+    : '  (none)';
+
+  // The concern block is the whole point of the seed — it's what the user
+  // actually wants to discuss. If it was omitted (e.g. direct API call
+  // with no body.concern), we tell the assistant to ask for it instead of
+  // inventing one.
+  const concernText = (concern && concern.trim().length > 0)
+    ? concern.trim()
+    : '(The user did not provide a specific concern when opening this chat. Before discussing anything else, ask them what part of this suggestion they want to interrogate.)';
+
+  return `Hi — I'm looking at a suggestion that Edward (a local repo-maintenance
+agent) surfaced while scanning one of my repositories. I'm not fully
+convinced by its conclusion and I want to reason through it with you.
+Please don't jump to proposing a fix — first help me interrogate the
+finding itself.
+
+## Repository
+- ${repo.full_name}
+- Default branch: ${repo.default_branch}
+- Primary language: ${repo.language}
+
+## Suggestion
+**${task.title}**
+
+- Type: ${task.type}
+- Risk level: ${task.risk_level}
+- Edward's confidence: ${task.confidence}
+- Surfaced at: ${task.suggested_at ?? '(unknown)'}
+
+### Edward's description
+${task.description || '(none)'}
+
+### Evidence Edward collected
+${evidence}
+
+### Estimated impact
+- Files likely touched: ${files}
+- Lines likely changed: ${lines}
+- Blast radius: ${blast}
+
+### Edward's proposed verification
+- Method: ${method}
+- Steps:
+${steps}
+- Success criteria:
+${success}
+
+---
+
+## My specific concern
+
+${concernText}
+
+---
+
+Please engage with my concern above directly. Start by restating it in
+your own words so I know you got it, then give me your honest read:
+
+- Is my concern well-founded given the evidence Edward collected?
+- What additional evidence, if any, would change your mind in either direction?
+- Is Edward's risk level proportional to the actual impact, or does my concern suggest it's miscalibrated?
+
+Be direct. If you think I'm wrong, say so and tell me why.
+`;
+}
+
+interface DiscussResult {
+  mode: 'terminal' | 'clipboard';
+  launchPath: string;
+  seedPath: string;
+  command: string;
+  note?: string;
+}
+
+function handleDiscuss(task: EdwardTask, concern?: string): Response {
+  const repo = repos.get(task.repo_id);
+  if (!repo) return json({ error: 'Repo for task not found' }, 404);
+
+  const chatDir = join(CHAT_DIR_ROOT, task.id);
+  const seedPath = join(chatDir, 'seed.md');
+  const launchPath = join(chatDir, 'launch.sh');
+
+  try {
+    mkdirSync(chatDir, { recursive: true });
+    writeFileSync(seedPath, buildDiscussSeed(repo, task, concern), 'utf-8');
+
+    // launch.sh reads the seed prompt fresh from disk via $(cat seed.md), so
+    // the prompt never touches shell or AppleScript escaping. CLAUDE_BIN is
+    // a trusted path resolved at server start (env var or Bun.which) — no
+    // user input flows into it.
+    const launchScript = `#!/bin/bash
+cd "$(dirname "$0")"
+exec "${CLAUDE_BIN}" "$(cat seed.md)"
+`;
+    writeFileSync(launchPath, launchScript, 'utf-8');
+    chmodSync(launchPath, 0o755);
+  } catch (err: any) {
+    return json({ error: `Failed to write chat files: ${err.message}` }, 500);
+  }
+
+  const command = `bash ${launchPath}`;
+  const forceClipboard = process.env.EDWARD_FORCE_CLIPBOARD_DISCUSS === '1';
+  const isDarwin = process.platform === 'darwin';
+  const result: DiscussResult = { mode: 'clipboard', launchPath, seedPath, command };
+
+  if (isDarwin && !forceClipboard) {
+    try {
+      // launchPath is under /tmp/edward-chats/<uuid>/ — uuid is hex only,
+      // so the path cannot contain AppleScript or shell metacharacters.
+      const doScript = `tell application "Terminal" to do script "bash ${launchPath}"`;
+      const activate = 'tell application "Terminal" to activate';
+      const proc = spawn('osascript', ['-e', doScript, '-e', activate], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      proc.unref();
+      result.mode = 'terminal';
+    } catch (err: any) {
+      result.note = `osascript failed (${err.message}); returning clipboard fallback`;
+    }
+  }
+
+  return json(result);
+}
+
 // ── Route handlers ──
 
 async function handleRequest(req: Request): Promise<Response> {
@@ -529,7 +687,7 @@ async function handleRequest(req: Request): Promise<Response> {
   if (actionMatch && method === 'POST') {
     const task = tasks.get(actionMatch[1]);
     if (!task) return json({ error: 'Task not found' }, 404);
-    const body = await req.json() as { action: string; reason?: string; snoozeUntil?: string };
+    const body = await req.json() as { action: string; reason?: string; snoozeUntil?: string; concern?: string };
 
     switch (body.action) {
       case 'approve': {
@@ -553,6 +711,10 @@ async function handleRequest(req: Request): Promise<Response> {
         task.status = 'snoozed';
         task.snooze_until = body.snoozeUntil || new Date(Date.now() + 86400000).toISOString();
         return json({ status: 'snoozed', until: task.snooze_until });
+      case 'discuss':
+        // Read-only action: spins up a claude CLI chat seeded with the task
+        // context + the user's specific concern. Does NOT mutate task state.
+        return handleDiscuss(task, body.concern);
       default:
         return json({ error: 'Invalid action' }, 400);
     }
