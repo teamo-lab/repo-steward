@@ -53,28 +53,20 @@ reports/                  v0.2 vs v0.3 comparison + clawschool findings
 
 ## Developing a new feature
 
-`edward` is the active development branch. `main` is kept in sync with it.
-Always branch off `edward` (or `main` — they point at the same commit).
+Branch off `main` and PR back into `main`. There is no long-lived dev
+branch — we iterate directly on `main` to keep collaboration friction low.
 
 ```bash
 git fetch origin
-git checkout -b feat/<short-name> origin/edward
+git checkout -b feat/<short-name> origin/main
 # ...work, commit...
 git push -u origin feat/<short-name>
+gh pr create --base main --title "feat: ..." --body "..."
 ```
 
-If you already have a local `edward` checkout from before the v0.4.0
-history rewrite, reset it before branching:
-
-```bash
-git fetch origin
-git checkout edward
-git reset --hard origin/edward
-```
-
-**Do not rebase old local branches onto the new `edward`.** The pre-v0.4.0
-history was rewritten to remove vendored third-party source. Cherry-pick
-the specific commits you need instead of running a full `git rebase edward`.
+**Do not rebase old local branches onto `main`.** The pre-v0.4.0 history
+was rewritten in 2026-04 to remove vendored third-party source. Cherry-pick
+the specific commits you need instead of running a full `git rebase main`.
 
 ## License
 

@@ -94,9 +94,9 @@ product-flow-first prompt. Read them before touching `server.ts`'s
 
 ### Hard "do not" list
 
-- **Do not force-push `edward` or `main`** — they were rewritten once,
-  in 2026-04 to scrub third-party vendored source. Any further history
-  rewriting needs explicit user approval.
+- **Do not force-push `main`** — it was rewritten once in 2026-04 to
+  scrub third-party vendored source. Any further history rewriting
+  needs explicit user approval.
 - **Do not commit anything under `.agent-team/`, `sessions/`,
   `node_modules/`, or `dist/`**. All four are `.gitignore`d.
 - **Do not vendor third-party source trees** into the repo. Edward
@@ -182,7 +182,7 @@ commit.** Run `git status` before every commit to confirm.
 1. **Create branch** (see `README.md` → "Developing a new feature").
    ```bash
    git fetch origin
-   git checkout -b feat/<slug> origin/edward
+   git checkout -b feat/<slug> origin/main
    mkdir -p .agent-team/<slug>
    ```
 2. **Dispatch Planner** — give it the user request, Edward's file map,
@@ -205,7 +205,7 @@ commit.** Run `git status` before every commit to confirm.
 7. **After the last Sprint**, dispatch Evaluator for a final
    end-to-end pass (see "Acceptance" below).
 8. **Lead commits** — only source files (see next section).
-9. **Push feature branch** and open a PR against `edward`.
+9. **Push feature branch** and open a PR against `main`.
 
 ### What to commit
 
@@ -342,18 +342,18 @@ See `README.md` → "Developing a new feature". Short version:
 
 ```bash
 git fetch origin
-git checkout -b feat/<slug> origin/edward
+git checkout -b feat/<slug> origin/main
 # ...Planner → Generator → Evaluator loop...
 git add src/edward/... package.json ...   # explicit paths, never -A
 git commit -m "feat(edward): ..."
 git push -u origin feat/<slug>
-gh pr create --base edward --title "feat: ..." --body "..."
+gh pr create --base main --title "feat: ..." --body "..."
 ```
 
 **Never** run `git add -A` / `git add .` — the `.gitignore` should
 catch the working files, but explicit adds are the second safety net.
 
-**Never** force-push `edward` or `main`. Feature branches are yours.
+**Never** force-push `main`. Feature branches are yours.
 
 ---
 
