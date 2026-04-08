@@ -30,7 +30,7 @@
  * Design doc: .agent-team/polyglot/DESIGN.md
  */
 
-import { existsSync, readFileSync, statSync, writeFileSync, unlinkSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { spawn, execSync } from 'node:child_process';
 
 // ── Public types ──
@@ -80,6 +80,36 @@ export interface LLMCallResult {
   attempts: number;
   /** Set when ok === false. Provider-specific error message. */
   error?: string;
+  /** Which provider actually produced this result (may differ from caller's cfg.provider when fallback kicked in). */
+  provider?: Provider;
+  /** List of providers tried, in order. Populated by invokeLLMWithFallback. */
+  providersTried?: Provider[];
+}
+
+/**
+ * Heuristic: is this error likely to succeed if we retry on a different
+ * provider? We want to catch API-side transient failures (overload, rate
+ * limit, 5xx, network) and spawn failures (binary missing, timeout) but
+ * not fatal input errors (bad auth, invalid prompt, parse bugs in our
+ * own code).
+ */
+export function isRetriableLLMError(err: string | undefined): boolean {
+  if (!err) return false;
+  const s = err.toLowerCase();
+  const retriable = [
+    '529', '503', '502', '500', '504',
+    'overload', 'overloaded',
+    'rate limit', 'rate_limit', 'ratelimit',
+    'timeout', 'timed out', 'etimedout',
+    'econnreset', 'econnrefused', 'enotfound', 'network',
+    'socket hang up',
+    'spawn', 'enoent',
+    'no output file', 'empty output file',
+    'non-json output',
+    'claude exited', 'codex exited',
+    'sigterm', 'killed',
+  ];
+  return retriable.some(m => s.includes(m));
 }
 
 export interface ProviderAuthStatus {
@@ -307,13 +337,15 @@ export async function invokeLLM(
   }
 
   const t0 = Date.now();
+  let r: LLMCallResult;
   try {
     if (cfg.provider === 'claude') {
-      return await spawnClaude(prompt, cwd, cfg, t0);
+      r = await spawnClaude(prompt, cwd, cfg, t0);
+    } else {
+      r = await spawnCodex(prompt, cwd, cfg, t0);
     }
-    return await spawnCodex(prompt, cwd, cfg, t0);
   } catch (err: any) {
-    return {
+    r = {
       ok: false,
       stdout: '',
       costUsd: 0,
@@ -322,6 +354,63 @@ export async function invokeLLM(
       error: String(err?.message || err),
     };
   }
+  r.provider = cfg.provider;
+  return r;
+}
+
+/**
+ * Invoke primary provider, and on retriable failure, automatically retry
+ * once with the fallback provider. Default fallback is the other provider
+ * (claude↔codex). Pass `fallback: null` or `allowFallback: false` to disable.
+ *
+ * Logs `[edward] fallback <primary>→<fallback>: <reason>` via the provided
+ * onLog callback (defaults to console.error) when fallback triggers.
+ */
+export async function invokeLLMWithFallback(
+  prompt: string,
+  cwd: string,
+  cfg: LLMProviderConfig,
+  opts?: {
+    allowFallback?: boolean;
+    fallback?: Provider | null;
+    onLog?: (line: string) => void;
+  }
+): Promise<LLMCallResult> {
+  const log = opts?.onLog ?? ((line) => console.error(line));
+  const allowFallback = opts?.allowFallback !== false;
+
+  const primary = await invokeLLM(prompt, cwd, cfg);
+  primary.providersTried = [cfg.provider];
+  if (primary.ok || !allowFallback) return primary;
+  if (!isRetriableLLMError(primary.error)) return primary;
+
+  const fallback: Provider | null =
+    opts?.fallback !== undefined
+      ? opts.fallback
+      : cfg.provider === 'claude'
+      ? 'codex'
+      : 'claude';
+  if (!fallback || fallback === cfg.provider) return primary;
+
+  log(
+    `[edward] fallback ${cfg.provider}→${fallback}: ${(primary.error || '').slice(0, 200)}`
+  );
+
+  const fallbackCfg: LLMProviderConfig = {
+    ...cfg,
+    provider: fallback,
+    // Clear provider-specific model override so fallback picks its default
+    model: undefined,
+  };
+  const second = await invokeLLM(prompt, cwd, fallbackCfg);
+  second.attempts = (primary.attempts || 1) + (second.attempts || 1);
+  second.providersTried = [cfg.provider, fallback];
+  if (!second.ok) {
+    second.error =
+      `primary ${cfg.provider} failed (${(primary.error || '').slice(0, 200)}); ` +
+      `fallback ${fallback} failed (${(second.error || '').slice(0, 200)})`;
+  }
+  return second;
 }
 
 // ── Claude subprocess ──
@@ -513,7 +602,7 @@ async function spawnCodex(
       costUsd: 0,
       durationMs: duration,
       attempts: 1,
-      error: `codex exited ${exitCode}: ${stderr.slice(0, 500) || '(no stderr)'}`,
+      error: `codex exited ${exitCode}: ${stderr.slice(0, 2000) || '(no stderr)'}`,
     };
   }
 
