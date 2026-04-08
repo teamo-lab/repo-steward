@@ -338,6 +338,7 @@ export function describeAuthEnv(): AuthEnvStatus {
 
 export type CIScorecardDimensionKey =
   | 'presence' | 'triggers' | 'build_stage' | 'test_stage' | 'lint_stage'
+  | 'coverage'
   | 'security_scan' | 'branch_protection' | 'deployment' | 'hygiene' | 'docs';
 
 export interface CIScorecardDimension {
@@ -368,11 +369,31 @@ const ANALYSIS_PROMPT_INSTRUCTIONS = `You are Repo Steward, a senior product eng
 PHASE 0 — CI HEALTH AUDIT (run BEFORE phases 1-3)
 ══════════════════════════════════════
 
-You will be given two machine-detected inputs at the bottom of this prompt:
+You will be given three machine-detected inputs at the bottom of this prompt:
 - REPO_PROFILE: a JSON object describing topology, roles, stacks, package
   managers, test directories, and detected scripts
 - CI_CONFIG_FILES: an array of {path, provider, content} objects with the
   raw text of every CI config file found in the repo
+- CI_COVERAGE_ANALYSIS: a deterministic line-level analysis of how much
+  of the repo's source code is reachable by any verifying CI step
+  (test / lint / typecheck / security-scan / grep invariant / script
+  execution). Shape:
+    {
+      "coverage_ratio": 0.0478,         // covered_loc / total_loc
+      "covered_loc": 1717,
+      "total_loc": 35930,
+      "covered_files": 10,
+      "total_files": 117,
+      "covered_paths": ["tests", "wowchat/engine/text_risk_manage.py", ...],
+      "by_top_dir": { "wowchat": { covered_loc: 145, total_loc: 34146 }, ... },
+      "top_uncovered_dirs": [ { "dir": "wowchat/engine", "loc": 13278 }, ... ],
+      "fallback_reason": "no_ci" | "no_verifying_steps_detected" | "no_source_files"  // optional
+    }
+  Treat CI_COVERAGE_ANALYSIS.coverage_ratio as GROUND TRUTH. Do NOT
+  recompute it, do NOT second-guess it. The number comes from walking
+  the source tree and matching file paths against CI step commands —
+  it is strictly more accurate than anything you can infer by reading
+  workflow YAML yourself.
 
 Your job in Phase 0:
 
@@ -422,13 +443,39 @@ userImpact for ci_* findings = what production incident this CI gap would
 let through. Be specific.
 
 STEP D — Compute the CIScorecard
-Score these 10 dimensions on a 0-10 scale:
+Score these 11 dimensions on a 0-10 scale:
 
   presence            — any CI exists, valid syntax, matches host platform
   triggers            — push/pr/tag/schedule/manual coverage is appropriate
   build_stage         — install + build runs, matrix where appropriate, cached
-  test_stage          — tests run on every PR, gated, coverage tracked
+  test_stage          — tests run on every PR, gated, visible failure reporting
   lint_stage          — linter + typecheck present and enforcing
+  coverage            — fraction of source code (by LOC) that falls
+                        under at least one verifying CI step. This is
+                        NOT runtime test line-rate; it's static
+                        reachability: does any CI step touch this file?
+                        Read CI_COVERAGE_ANALYSIS.coverage_ratio directly
+                        and map through the table below. Do not
+                        recompute. Score rubric:
+                          10 = coverage_ratio >= 0.90
+                          8  = 0.75 <= ratio < 0.90
+                          6  = 0.50 <= ratio < 0.75
+                          4  = 0.30 <= ratio < 0.50
+                          2  = 0.10 <= ratio < 0.30
+                          0  = ratio < 0.10  OR  CI_COVERAGE_ANALYSIS.fallback_reason is set
+                        Use \`na\` only when
+                        CI_COVERAGE_ANALYSIS.fallback_reason == "no_source_files"
+                        (pure docs / dotfiles / static assets with zero
+                        source). For "no_ci" and "no_verifying_steps_detected"
+                        fallback reasons, score 0 and write the reason
+                        into gaps.
+
+                        For evidence, use CI_COVERAGE_ANALYSIS.covered_paths
+                        verbatim (these are the exact prefixes Edward
+                        extracted from CI).
+                        For gaps, use the top 3 entries of
+                        CI_COVERAGE_ANALYSIS.top_uncovered_dirs verbatim
+                        (these are the largest dead zones by LOC).
   security_scan       — dependabot/SAST/secret-scan/SBOM coverage
   branch_protection   — required checks on default branch (mark UNVERIFIED
                         in this version — we cannot query GitHub API yet)
@@ -439,11 +486,16 @@ Score these 10 dimensions on a 0-10 scale:
 For each dimension: status one of pass/partial/fail/unverified/na.
 - Use \`unverified\` for branch_protection in this version
 - Use \`na\` when the dimension does not apply (e.g., deployment for a
-  pure library repo)
+  pure library repo, coverage for a pure-docs repo)
 
 Composite score: weighted sum, weights:
-  presence:15, triggers:8, build_stage:12, test_stage:15, lint_stage:8,
-  security_scan:18, branch_protection:10, deployment:5, hygiene:5, docs:4
+  presence:15, triggers:8, build_stage:12, test_stage:10, lint_stage:8,
+  coverage:5, security_scan:18, branch_protection:10, deployment:5,
+  hygiene:5, docs:4
+(Sum = 100. test_stage dropped from 15 to 10 and the released 5 weight
+went to the new coverage dimension — you still need tests to exist, but
+"tests exist with no coverage signal" is worse than "tests exist with
+coverage reported".)
 Exclude any \`unverified\` or \`na\` dimension from BOTH numerator and
 denominator before normalizing to 0-100.
 
@@ -662,6 +714,7 @@ CIScorecard schema:
     "build_stage":       { ... },
     "test_stage":        { ... },
     "lint_stage":        { ... },
+    "coverage":          { ... },
     "security_scan":     { ... },
     "branch_protection": { ... },
     "deployment":        { ... },
@@ -730,7 +783,30 @@ CI_CONFIG_FILES (${ciRaw.configFiles.length} files, primary provider: ${ciRaw.pr
 ${JSON.stringify(ciFilesForPrompt, null, 2)}${ciFilesNote}
 
 ${hotModulesBlock}
+
+CI_COVERAGE_ANALYSIS (ground truth — deterministic line-level CI reachability):
+${JSON.stringify(coverageForPrompt(ciRaw.coverage), null, 2)}
 `;
+}
+
+/**
+ * Trim the coverage analysis down to the fields the LLM actually
+ * needs. The full CICoverageResult can be large on big repos (every
+ * extension + every top-level dir), but Phase 0 only reads a
+ * handful of headline numbers plus the top uncovered dirs.
+ */
+function coverageForPrompt(c: import('./ci_coverage.js').CICoverageResult) {
+  return {
+    coverage_ratio: Number(c.coverage_ratio.toFixed(4)),
+    covered_loc: c.covered_loc,
+    total_loc: c.total_loc,
+    covered_files: c.covered_files,
+    total_files: c.total_files,
+    covered_paths: c.covered_paths,
+    by_top_dir: c.by_top_dir,
+    top_uncovered_dirs: c.top_uncovered_dirs,
+    ...(c.fallback_reason ? { fallback_reason: c.fallback_reason } : {}),
+  };
 }
 
 /**
