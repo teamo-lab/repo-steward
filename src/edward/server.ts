@@ -16,7 +16,11 @@ import {
   loadRepoMemory, recordDismissal, recordAnswer, fingerprintFor,
 } from './repo_memory.js';
 import { invokeLLMWithFallback, isProvider, type Provider } from './llm_provider.js';
-import { loadBusinessContext, contextIsActionable, type BusinessContext } from './business_context.js';
+import {
+  loadBusinessContext, contextIsActionable, summarizeContext,
+  serializeContextToYaml, slugForRepo, writeContextToCache, getContextCachePath,
+  type BusinessContext,
+} from './business_context.js';
 import { enumerateFeatures, type FeatureSurface } from './feature_inventory.js';
 import { mapFeaturesToTests, type TestCoverageMap } from './test_mapping.js';
 import { runFunctionalCIAnalysis, synthesizedTestToTaskFields } from './functional_ci.js';
@@ -926,7 +930,16 @@ interface AnalyzeResult {
 
 async function analyzeRepoWithAgent(
   fullName: string,
-  opts?: { skipProduct?: boolean; provider?: Provider; allowFallback?: boolean; branch?: string }
+  opts?: {
+    skipProduct?: boolean;
+    provider?: Provider;
+    allowFallback?: boolean;
+    branch?: string;
+    /** Absolute path to a .yml/.json context file that overrides all other context sources. */
+    contextFile?: string;
+    /** If true, the caller explicitly chose to skip functional CI for this run. */
+    skipFunctionalCI?: boolean;
+  }
 ): Promise<AnalyzeResult> {
   const tmpDir = `/tmp/edward-${Date.now()}`;
 
@@ -957,29 +970,28 @@ async function analyzeRepoWithAgent(
       console.log(`[edward] hot modules: none (no git history or coverage data)`);
     }
 
-    // Functional-CI Layer 3: load business context (`.edward/context.yml`
-    // or auto-extract from README/OpenAPI). If we can't build an
-    // actionable context, the functional CI phase will short-circuit
-    // and we fall back to the existing Phase 0 / 1-3 outputs.
+    // Functional-CI Layer 4: enumerate features first so that if we
+    // fall through to auto-extract, we have the feature surface to
+    // give the LLM as a signal.
+    const featureSurface: FeatureSurface = enumerateFeatures(`${tmpDir}/repo`, profile);
+    const testCoverage: TestCoverageMap = mapFeaturesToTests(`${tmpDir}/repo`, featureSurface);
+
+    // Functional-CI Layer 3: load business context. Priority:
+    //   1. opts.contextFile (CLI --context-file or resolved cache path)
+    //   2. EDWARD_CONTEXT_FILE env var
+    //   3. ~/.edward/contexts/<slug>.yml user cache
+    //   4. <repo>/.edward/context.yml committed file
+    //   5. LLM auto-extract (gated by !skipProduct + !skipFunctionalCI)
     const businessContext: BusinessContext = await loadBusinessContext(
       `${tmpDir}/repo`,
       {
         provider: effectiveProvider,
-        allowAutoExtract: !opts?.skipProduct,
+        allowAutoExtract: !opts?.skipProduct && !opts?.skipFunctionalCI,
+        featureSurface,
+        overridePath: opts?.contextFile,
+        repoSlug: slugForRepo(fullName),
       }
     );
-    console.log(
-      `[edward] business context: source=${businessContext.source} ` +
-      `project="${businessContext.project.name || '(unnamed)'}" ` +
-      `flows=${businessContext.critical_flows.length} ` +
-      `invariants=${businessContext.critical_flows.reduce((a, f) => a + f.invariants.length, 0)}`
-    );
-
-    // Functional-CI Layer 4: enumerate features + map to existing tests.
-    // Cheap (pure regex + fs walk), runs regardless of whether the
-    // downstream LLM phases execute.
-    const featureSurface: FeatureSurface = enumerateFeatures(`${tmpDir}/repo`, profile);
-    const testCoverage: TestCoverageMap = mapFeaturesToTests(`${tmpDir}/repo`, featureSurface);
     console.log(
       `[edward] feature surface: endpoints=${featureSurface.endpoints.length} ` +
       `llm_calls=${featureSurface.llm_calls.length} ` +
@@ -988,6 +1000,12 @@ async function analyzeRepoWithAgent(
     );
     console.log(
       `[edward] test mapping: ${testCoverage.summary.features_with_any_test}/${testCoverage.summary.total_features} features have some test coverage`
+    );
+    console.log(
+      `[edward] business context: source=${businessContext.source} ` +
+      `project="${businessContext.project.name || '(unnamed)'}" ` +
+      `flows=${businessContext.critical_flows.length} ` +
+      `invariants=${businessContext.critical_flows.reduce((a, f) => a + f.invariants.length, 0)}`
     );
 
     // Dispatch through the provider abstraction. invokeLLMWithFallback
@@ -1052,11 +1070,14 @@ async function analyzeRepoWithAgent(
     const wantPhase0 = true;
     const wantPhase123 = !opts?.skipProduct;
 
-    // Functional CI phase runs alongside the others whenever we have an
-    // actionable business context. Always skipped on `ci-audit` / skipProduct
-    // runs to keep that flag's semantics clean — ci-audit is scorecard-only.
+    // Functional CI phase runs alongside the others whenever we have
+    // an actionable business context. Skipped on `ci-audit` /
+    // skipProduct runs (scorecard-only semantics), and skipped when
+    // the caller explicitly chose --skip-functional-ci.
     const wantFunctionalCI =
-      !opts?.skipProduct && contextIsActionable(businessContext);
+      !opts?.skipProduct &&
+      !opts?.skipFunctionalCI &&
+      contextIsActionable(businessContext);
 
     const phases: Promise<PhaseResult>[] = [];
     if (wantPhase0) phases.push(runPhase('phase0'));
@@ -1741,6 +1762,146 @@ async function handleRequest(req: Request): Promise<Response> {
     return json({ running: discoveryRunning, taskCount: repoTasks.length });
   }
 
+  // Context resolve — pre-scan step that clones the repo, runs the
+  // deterministic static layers, and returns the business context
+  // Edward would use for this repo. The CLI calls this BEFORE
+  // triggering discover so it can show the user what Edward inferred
+  // and let them accept / edit / replace.
+  //
+  // Returns { status, source, context_yaml, summary, cache_path }.
+  // Sync request — cannot run concurrently with another resolve for
+  // the same repo.
+  const contextResolveMatch = path.match(/^\/api\/v1\/repos\/([^/]+)\/context\/resolve$/);
+  if (contextResolveMatch && method === 'POST') {
+    const repo = repos.get(contextResolveMatch[1]);
+    if (!repo) return json({ error: 'Repo not found' }, 404);
+
+    const providerParam = url.searchParams.get('provider');
+    let provider: Provider | undefined;
+    if (providerParam !== null) {
+      if (!isProvider(providerParam)) {
+        return json({ error: `Invalid provider '${providerParam}'. Valid: claude, codex` }, 400);
+      }
+      provider = providerParam;
+    }
+    const forceRegenerate = url.searchParams.get('refresh') === '1';
+    const noAutoExtract = url.searchParams.get('no_auto') === '1';
+    const branchParam = url.searchParams.get('branch');
+    let branch: string | undefined;
+    if (branchParam && /^[A-Za-z0-9._/-]{1,200}$/.test(branchParam)) {
+      branch = branchParam;
+    }
+
+    const tmpDir = `/tmp/edward-ctx-${Date.now()}`;
+    try {
+      cloneRepoWithToken(repo.full_name, `${tmpDir}/repo`, branch);
+      const profile = detectRepoProfile(`${tmpDir}/repo`);
+      const surface = enumerateFeatures(`${tmpDir}/repo`, profile);
+
+      const ctx = await loadBusinessContext(`${tmpDir}/repo`, {
+        provider: provider ?? 'claude',
+        allowAutoExtract: !noAutoExtract,
+        featureSurface: surface,
+        repoSlug: slugForRepo(repo.full_name),
+        forceRegenerate,
+      });
+
+      const status: 'loaded' | 'generated' | 'empty' =
+        ctx.source === 'empty'
+          ? 'empty'
+          : ctx.source === 'auto_extracted'
+          ? 'generated'
+          : 'loaded';
+
+      const cachePath = getContextCachePath(slugForRepo(repo.full_name));
+      const contextYaml = ctx.source === 'empty' ? '' : serializeContextToYaml(ctx);
+
+      return json({
+        status,
+        source: ctx.source,
+        context_yaml: contextYaml,
+        summary: summarizeContext(ctx),
+        cache_path: cachePath,
+        feature_surface: {
+          endpoints: surface.endpoints.length,
+          llm_calls: surface.llm_calls.length,
+          cron_jobs: surface.cron_jobs.length,
+          queue_consumers: surface.queue_consumers.length,
+        },
+      });
+    } catch (err: any) {
+      return json({ error: `context resolve failed: ${err?.message || err}` }, 500);
+    } finally {
+      try { execSync(`rm -rf ${tmpDir}`, { stdio: 'pipe' }); } catch {}
+    }
+  }
+
+  // Context write — persist a user-approved context to the cache at
+  // ~/.edward/contexts/<slug>.yml so subsequent discover runs pick
+  // it up automatically. Accepts the raw YAML text in the body so
+  // users can edit and post back unchanged.
+  const contextWriteMatch = path.match(/^\/api\/v1\/repos\/([^/]+)\/context$/);
+  if (contextWriteMatch && method === 'PUT') {
+    const repo = repos.get(contextWriteMatch[1]);
+    if (!repo) return json({ error: 'Repo not found' }, 404);
+
+    let body: { context_yaml?: string };
+    try {
+      body = await req.json() as any;
+    } catch {
+      return json({ error: 'Body must be JSON with { context_yaml: string }' }, 400);
+    }
+    if (typeof body.context_yaml !== 'string' || body.context_yaml.trim() === '') {
+      return json({ error: 'context_yaml field missing or empty' }, 400);
+    }
+
+    // Validate by parsing. Reject if the YAML doesn't produce any
+    // flows — that would mean the user saved an empty context and
+    // we'd then silently skip functional CI on every run.
+    let parsedCtx: BusinessContext;
+    try {
+      const { parseContextYaml } = await import('./business_context.js');
+      parsedCtx = parseContextYaml(body.context_yaml);
+    } catch (err: any) {
+      return json({ error: `context YAML parse failed: ${err?.message || err}` }, 400);
+    }
+
+    const slug = slugForRepo(repo.full_name);
+    try {
+      const cachePath = writeContextToCache(slug, parsedCtx);
+      return json({
+        ok: true,
+        cache_path: cachePath,
+        summary: summarizeContext(parsedCtx),
+      });
+    } catch (err: any) {
+      return json({ error: `failed to write cache: ${err?.message || err}` }, 500);
+    }
+  }
+
+  // Context read — returns the currently cached context for this
+  // repo, if any.
+  if (contextWriteMatch && method === 'GET') {
+    const repo = repos.get(contextWriteMatch[1]);
+    if (!repo) return json({ error: 'Repo not found' }, 404);
+    const cachePath = getContextCachePath(slugForRepo(repo.full_name));
+    if (!existsSync(cachePath)) {
+      return json({ cache_path: cachePath, context_yaml: null, summary: null });
+    }
+    try {
+      const content = readFileSync(cachePath, 'utf-8');
+      const { parseContextYaml } = await import('./business_context.js');
+      const parsed = parseContextYaml(content);
+      return json({
+        cache_path: cachePath,
+        context_yaml: content,
+        summary: summarizeContext(parsed),
+      });
+    } catch (err: any) {
+      return json({ error: `failed to read cache: ${err?.message || err}` }, 500);
+    }
+  }
+
   // Discover (async — returns immediately, runs analysis in background)
   // Query param: ?skip_product=1 → only run Phase 0 (CI audit), faster.
   const discoverMatch = path.match(/^\/api\/v1\/repos\/([^/]+)\/discover$/);
@@ -1764,6 +1925,25 @@ async function handleRequest(req: Request): Promise<Response> {
 
     const skipProduct = url.searchParams.get('skip_product') === '1';
     const noFallback = url.searchParams.get('no_fallback') === '1';
+    const skipFunctionalCI = url.searchParams.get('skip_functional_ci') === '1';
+
+    // Optional ?context_file=<absolute_path> — overrides every other
+    // context source including env var and cache. Must be an absolute
+    // path on the server's own filesystem. Validated loosely: no `..`,
+    // no shell metacharacters. File readability is checked at load
+    // time; invalid content silently falls back to cache/auto-extract.
+    const contextFileParam = url.searchParams.get('context_file');
+    let contextFile: string | undefined;
+    if (contextFileParam !== null && contextFileParam !== '') {
+      if (
+        !contextFileParam.startsWith('/') ||
+        contextFileParam.includes('..') ||
+        /[;|&`$()]/.test(contextFileParam)
+      ) {
+        return json({ error: `Invalid context_file '${contextFileParam}'. Must be absolute, no '..', no shell metachars.` }, 400);
+      }
+      contextFile = contextFileParam;
+    }
 
     // Optional ?branch=<name> to scan a non-default branch. Validated
     // against a conservative ref-name regex so we don't shell-inject
@@ -1788,9 +1968,18 @@ async function handleRequest(req: Request): Promise<Response> {
           skipProduct ? 'skip_product' : null,
           provider ? `provider=${provider}` : null,
           branch ? `branch=${branch}` : null,
+          contextFile ? `context_file=${contextFile}` : null,
+          skipFunctionalCI ? 'skip_functional_ci' : null,
         ].filter(Boolean).join(', ');
         console.log(`[edward] Running agent analysis for ${repo.full_name}${logOpts ? ` (${logOpts})` : ''}...`);
-        const result = await analyzeRepoWithAgent(repo.full_name, { skipProduct, provider, allowFallback: !noFallback, branch });
+        const result = await analyzeRepoWithAgent(repo.full_name, {
+          skipProduct,
+          provider,
+          allowFallback: !noFallback,
+          branch,
+          contextFile,
+          skipFunctionalCI,
+        });
 
         // Stamp "discovery ran" regardless of outcome so the dashboard can
         // distinguish "never ran" vs "ran but no scorecard returned" (CR #4).

@@ -19,11 +19,13 @@
  * ship a YAML library just for this.
  */
 
-import { readFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync, existsSync, readdirSync, statSync, mkdirSync, writeFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { homedir } from 'node:os';
 import type { CIRawConfig } from './ci_extract.js';
 import type { RepoProfile } from './profile.js';
 import { invokeLLMWithFallback, type Provider } from './llm_provider.js';
+import type { FeatureSurface } from './feature_inventory.js';
 
 // ── Public types ──
 
@@ -73,7 +75,7 @@ export interface BusinessContext {
   /** Explicit negative rules — "this must NEVER be true". */
   forbidden: string[];
   /** How the context was sourced — informational only, not used in matching. */
-  source: 'context.yml' | 'context.json' | 'auto_extracted' | 'empty';
+  source: 'context.yml' | 'context.json' | 'auto_extracted' | 'user_cache' | 'user_override' | 'empty';
 }
 
 export const EMPTY_CONTEXT: BusinessContext = {
@@ -86,54 +88,140 @@ export const EMPTY_CONTEXT: BusinessContext = {
 
 // ── Entrypoint ──
 
+export interface LoadContextOptions {
+  provider?: Provider;
+  /** Whether to LLM-auto-extract if no file source exists. */
+  allowAutoExtract?: boolean;
+  /** Optional feature surface to inject into the auto-extract prompt — makes inference from code-only repos possible. */
+  featureSurface?: FeatureSurface;
+  /** Absolute file path (yml/yaml/json). Highest priority, beats everything else. */
+  overridePath?: string;
+  /** Canonical slug for the repo (e.g. "owner_repo"), used to locate the per-repo cache file in ~/.edward/contexts/. */
+  repoSlug?: string;
+  /** Force regeneration: ignore cache and file-based sources, go straight to auto-extract. */
+  forceRegenerate?: boolean;
+}
+
 /**
- * Load business context for a cloned repo. Tries the three sources in
- * order. If `llmInvoker` is provided and no file-based source yields
- * a context, falls back to an LLM-based auto-extract from README +
- * OpenAPI. Never throws — returns EMPTY_CONTEXT on total failure.
+ * Load business context for a cloned repo. Tries sources in priority
+ * order:
+ *
+ *   1. `overridePath` (CLI --context-file)
+ *   2. `EDWARD_CONTEXT_FILE` env var
+ *   3. `~/.edward/contexts/<slug>.yml|yaml|json` user cache
+ *   4. `<repoDir>/.edward/context.yml|yaml|json` committed file
+ *   5. LLM auto-extract from README / OpenAPI / code signals (if
+ *      `allowAutoExtract`)
+ *
+ * Setting `forceRegenerate` skips steps 1-4 and goes straight to
+ * auto-extract. Never throws — returns EMPTY_CONTEXT on total failure.
  */
 export async function loadBusinessContext(
   repoDir: string,
-  opts?: {
-    provider?: Provider;
-    allowAutoExtract?: boolean;
-  }
+  opts?: LoadContextOptions
 ): Promise<BusinessContext> {
-  const yml = join(repoDir, '.edward', 'context.yml');
-  const yaml = join(repoDir, '.edward', 'context.yaml');
-  const jsonPath = join(repoDir, '.edward', 'context.json');
-
-  for (const p of [yml, yaml]) {
-    if (safeExists(p)) {
-      try {
-        const text = readFileSync(p, 'utf-8');
-        return parseContextYaml(text);
-      } catch (err: any) {
-        console.error(`[edward] .edward/context.yml parse failed: ${err?.message || err}`);
-        // fall through to JSON / auto-extract
-      }
-    }
+  // 1. Explicit override path
+  if (!opts?.forceRegenerate && opts?.overridePath) {
+    const ctx = tryLoadFromAbsPath(opts.overridePath, 'user_override');
+    if (ctx) return ctx;
   }
 
-  if (safeExists(jsonPath)) {
-    try {
-      const text = readFileSync(jsonPath, 'utf-8');
-      const raw = JSON.parse(text);
-      return normalizeContext(raw, 'context.json');
-    } catch (err: any) {
-      console.error(`[edward] .edward/context.json parse failed: ${err?.message || err}`);
-    }
+  // 2. Env var
+  if (!opts?.forceRegenerate && process.env.EDWARD_CONTEXT_FILE) {
+    const ctx = tryLoadFromAbsPath(process.env.EDWARD_CONTEXT_FILE, 'user_override');
+    if (ctx) return ctx;
   }
 
+  // 3. User cache keyed by repo slug
+  if (!opts?.forceRegenerate && opts?.repoSlug) {
+    const cachePath = getContextCachePath(opts.repoSlug);
+    const ctx = tryLoadFromAbsPath(cachePath, 'user_cache');
+    if (ctx) return ctx;
+  }
+
+  // 4. Committed in-repo files
+  if (!opts?.forceRegenerate) {
+    const yml = join(repoDir, '.edward', 'context.yml');
+    const yaml = join(repoDir, '.edward', 'context.yaml');
+    const jsonPath = join(repoDir, '.edward', 'context.json');
+    for (const p of [yml, yaml]) {
+      const ctx = tryLoadFromAbsPath(p, 'context.yml');
+      if (ctx) return ctx;
+    }
+    const fromJson = tryLoadFromAbsPath(jsonPath, 'context.json');
+    if (fromJson) return fromJson;
+  }
+
+  // 5. Auto-extract
   if (opts?.allowAutoExtract) {
     try {
-      return await autoExtractContext(repoDir, opts.provider);
+      return await autoExtractContext(repoDir, opts.provider, opts.featureSurface);
     } catch (err: any) {
       console.error(`[edward] auto-extract business context failed: ${err?.message || err}`);
     }
   }
 
   return { ...EMPTY_CONTEXT };
+}
+
+/**
+ * Try to load a context from an absolute file path. Returns null if
+ * the file doesn't exist or can't be parsed. Supports .yml / .yaml
+ * (YAML subset) and .json.
+ */
+function tryLoadFromAbsPath(
+  absPath: string,
+  source: BusinessContext['source']
+): BusinessContext | null {
+  if (!safeExists(absPath)) return null;
+  try {
+    const text = readFileSync(absPath, 'utf-8');
+    if (absPath.endsWith('.json')) {
+      const raw = JSON.parse(text);
+      return normalizeContext(raw, source);
+    }
+    // Assume YAML otherwise
+    const ctx = parseContextYaml(text);
+    return { ...ctx, source };
+  } catch (err: any) {
+    console.error(`[edward] failed to load context from ${absPath}: ${err?.message || err}`);
+    return null;
+  }
+}
+
+// ── User-level cache ──
+
+/**
+ * Canonical path where Edward stores per-repo context overrides the
+ * user has approved/edited. Lives under ~/.edward/contexts/ so it
+ * survives across discover runs but is not committed.
+ *
+ * `.yml` extension by default — when Edward writes a generated
+ * context, it uses the YAML serializer so the user can hand-edit it.
+ */
+export function getContextCachePath(slug: string): string {
+  const safeSlug = slug.replace(/[^A-Za-z0-9._-]/g, '_');
+  return join(homedir(), '.edward', 'contexts', `${safeSlug}.yml`);
+}
+
+/**
+ * Derive the cache slug from an `owner/repo` full name.
+ */
+export function slugForRepo(fullName: string): string {
+  return fullName.replace(/\//g, '_');
+}
+
+/**
+ * Persist a BusinessContext to its user-cache path as YAML. Creates
+ * parent directories on demand. Returns the absolute path written.
+ */
+export function writeContextToCache(slug: string, ctx: BusinessContext): string {
+  const absPath = getContextCachePath(slug);
+  const dir = dirname(absPath);
+  try { mkdirSync(dir, { recursive: true }); } catch { /* ignore */ }
+  const yaml = serializeContextToYaml(ctx);
+  writeFileSync(absPath, yaml, 'utf-8');
+  return absPath;
 }
 
 function safeExists(p: string): boolean {
@@ -485,27 +573,27 @@ export function normalizeContext(raw: any, source: BusinessContext['source']): B
 // ── Auto-extract from repo ──
 
 /**
- * LLM-assisted auto-extraction of business context from a repo's
- * existing files. Inputs we look at, in order of trust:
+ * LLM-assisted auto-extraction of business context from a repo. Uses
+ * every signal we can cheaply gather, in roughly this order of trust:
  *
- *   1. OpenAPI / Swagger / JSON Schema files at repo root
- *   2. README.md / README.* at repo root
- *   3. docs/*.md (first ~100KB collected)
+ *   1. README / docs — explicit product description if present
+ *   2. OpenAPI / Swagger — formal API contracts
+ *   3. Package manifests — project name / description / keywords
+ *   4. Feature surface — enumerated routes / LLM calls / cron / queue
+ *      (passed from the caller; produced by feature_inventory.ts)
+ *   5. Entry-point files — main.py, index.ts, cmd/main.go docstrings
+ *   6. Top-level directory tree — last resort shape hint
  *
- * The LLM call asks: "given these docs, emit a BusinessContext JSON
- * following this exact schema". We use a single LLM call with a
- * tight prompt and strict JSON output. Falls back to EMPTY_CONTEXT
- * if the call fails or the output can't be coerced.
- *
- * This is deliberately conservative: auto-extract should produce a
- * reasonable ~60% starting point for teams that haven't written
- * `.edward/context.yml` yet, not a gold-standard replacement.
+ * The LLM is then asked to synthesize a BusinessContext from whatever
+ * combination of these is available. Even a code-only repo with no
+ * docs should produce a usable context via signals 3-6.
  */
 export async function autoExtractContext(
   repoDir: string,
-  provider?: Provider
+  provider?: Provider,
+  featureSurface?: FeatureSurface
 ): Promise<BusinessContext> {
-  const sources = gatherAutoExtractSources(repoDir);
+  const sources = gatherAutoExtractSources(repoDir, featureSurface);
   if (sources.totalBytes === 0) {
     return { ...EMPTY_CONTEXT };
   }
@@ -519,7 +607,7 @@ export async function autoExtractContext(
       model: provider === 'claude' || !provider ? 'sonnet' : undefined,
       maxTurns: 6,
       maxBudgetUsd: 0.5,
-      timeoutMs: 180_000,
+      timeoutMs: 240_000,
     },
     { allowFallback: true }
   );
@@ -542,18 +630,43 @@ interface AutoExtractSources {
   openapi: Array<{ path: string; content: string }>;
   readme: { path: string; content: string } | null;
   docs: Array<{ path: string; content: string }>;
+  manifests: Array<{ path: string; content: string }>;
+  entry_points: Array<{ path: string; content: string }>;
+  feature_summary: string | null;
+  dir_tree: string | null;
   totalBytes: number;
 }
 
-function gatherAutoExtractSources(repoDir: string): AutoExtractSources {
+function gatherAutoExtractSources(
+  repoDir: string,
+  featureSurface?: FeatureSurface
+): AutoExtractSources {
   const result: AutoExtractSources = {
     openapi: [],
     readme: null,
     docs: [],
+    manifests: [],
+    entry_points: [],
+    feature_summary: null,
+    dir_tree: null,
     totalBytes: 0,
   };
 
-  // OpenAPI / Swagger candidates
+  // Signal 1: README
+  const readmeCandidates = ['README.md', 'README.rst', 'README.txt', 'README', 'readme.md'];
+  for (const name of readmeCandidates) {
+    const abs = join(repoDir, name);
+    if (safeExists(abs)) {
+      try {
+        const content = readFileSync(abs, 'utf-8').slice(0, 50_000);
+        result.readme = { path: name, content };
+        result.totalBytes += content.length;
+        break;
+      } catch { /* ignore */ }
+    }
+  }
+
+  // Signal 2: OpenAPI / Swagger
   const openapiCandidates = [
     'openapi.yaml', 'openapi.yml', 'openapi.json',
     'swagger.yaml', 'swagger.yml', 'swagger.json',
@@ -570,25 +683,10 @@ function gatherAutoExtractSources(repoDir: string): AutoExtractSources {
     }
   }
 
-  // README
-  const readmeCandidates = ['README.md', 'README.rst', 'README.txt', 'README', 'readme.md'];
-  for (const name of readmeCandidates) {
-    const abs = join(repoDir, name);
-    if (safeExists(abs)) {
-      try {
-        const content = readFileSync(abs, 'utf-8').slice(0, 50_000);
-        result.readme = { path: name, content };
-        result.totalBytes += content.length;
-        break;
-      } catch { /* ignore */ }
-    }
-  }
-
-  // docs/*.md — first 5 files, 20KB each, 100KB cap total
+  // Signal 2.5: docs/*.md — first 5 files, 20KB each, 100KB cap total
   const docsDir = join(repoDir, 'docs');
   if (safeExists(docsDir)) {
     try {
-      const { readdirSync, statSync } = require('node:fs');
       const entries: string[] = readdirSync(docsDir);
       let budget = 100_000;
       let count = 0;
@@ -610,7 +708,134 @@ function gatherAutoExtractSources(repoDir: string): AutoExtractSources {
     } catch { /* ignore */ }
   }
 
+  // Signal 3: package manifests — name / description / keywords across stacks
+  const manifestCandidates = [
+    'package.json',
+    'pyproject.toml',
+    'setup.py',
+    'setup.cfg',
+    'Cargo.toml',
+    'go.mod',
+    'composer.json',
+    'Gemfile',
+    'pom.xml',
+    'build.gradle',
+    'build.gradle.kts',
+  ];
+  for (const name of manifestCandidates) {
+    const abs = join(repoDir, name);
+    if (safeExists(abs)) {
+      try {
+        const content = readFileSync(abs, 'utf-8').slice(0, 15_000);
+        result.manifests.push({ path: name, content });
+        result.totalBytes += content.length;
+      } catch { /* ignore */ }
+    }
+  }
+
+  // Signal 4: entry point files — first 4KB of each likely main entry
+  const entryCandidates = [
+    'main.py', 'app.py', 'server.py', 'wsgi.py', 'asgi.py', 'manage.py',
+    'src/main.py', 'src/app.py',
+    'index.ts', 'index.js', 'main.ts', 'server.ts', 'server.js', 'app.ts', 'app.js',
+    'src/index.ts', 'src/index.js', 'src/main.ts', 'src/main.js',
+    'cmd/main.go', 'main.go',
+    'src/main.rs',
+    'Program.cs',
+  ];
+  let entryCount = 0;
+  for (const rel of entryCandidates) {
+    if (entryCount >= 3) break;
+    const abs = join(repoDir, rel);
+    if (safeExists(abs)) {
+      try {
+        const content = readFileSync(abs, 'utf-8').slice(0, 4_000);
+        result.entry_points.push({ path: rel, content });
+        result.totalBytes += content.length;
+        entryCount++;
+      } catch { /* ignore */ }
+    }
+  }
+
+  // Signal 5: feature surface (from feature_inventory) — grouped by top dir
+  if (featureSurface) {
+    const lines: string[] = [];
+    lines.push(`Total: endpoints=${featureSurface.endpoints.length}, llm_calls=${featureSurface.llm_calls.length}, cron=${featureSurface.cron_jobs.length}, queue=${featureSurface.queue_consumers.length}`);
+    // Group endpoints by top-level dir
+    const byDir: Record<string, string[]> = {};
+    for (const f of featureSurface.endpoints) {
+      const top = f.file.split('/')[0] || '.';
+      if (!byDir[top]) byDir[top] = [];
+      if (byDir[top].length < 8) byDir[top].push(`  ${f.label}  (${f.file}:${f.line}, ${f.framework})`);
+    }
+    const topDirs = Object.keys(byDir).slice(0, 12);
+    for (const dir of topDirs) {
+      lines.push(`\n[${dir}/] (${byDir[dir].length}+ endpoints)`);
+      lines.push(...byDir[dir]);
+    }
+    if (featureSurface.cron_jobs.length > 0) {
+      lines.push(`\nCron jobs:`);
+      for (const c of featureSurface.cron_jobs.slice(0, 10)) {
+        lines.push(`  ${c.label}  (${c.file}:${c.line})`);
+      }
+    }
+    if (featureSurface.queue_consumers.length > 0) {
+      lines.push(`\nQueue consumers:`);
+      for (const c of featureSurface.queue_consumers.slice(0, 10)) {
+        lines.push(`  ${c.label}  (${c.file}:${c.line})`);
+      }
+    }
+    if (featureSurface.llm_calls.length > 0) {
+      lines.push(`\nLLM callsites:`);
+      for (const c of featureSurface.llm_calls.slice(0, 10)) {
+        lines.push(`  ${c.label}  (${c.file}:${c.line})`);
+      }
+    }
+    const summary = lines.join('\n').slice(0, 12_000);
+    result.feature_summary = summary;
+    result.totalBytes += summary.length;
+  }
+
+  // Signal 6: shallow directory tree
+  result.dir_tree = buildShallowTree(repoDir, 2).slice(0, 4_000);
+  result.totalBytes += result.dir_tree.length;
+
   return result;
+}
+
+function buildShallowTree(repoDir: string, maxDepth: number): string {
+  const skip = new Set([
+    '.git', 'node_modules', 'vendor', 'dist', 'build', 'target',
+    '__pycache__', '.venv', 'venv', '.next', '.nuxt', '.cache',
+    'coverage', '.pytest_cache', '.mypy_cache', '.tox',
+  ]);
+  const lines: string[] = [];
+  const walk = (abs: string, rel: string, depth: number) => {
+    if (depth > maxDepth) return;
+    let entries: string[];
+    try { entries = readdirSync(abs); } catch { return; }
+    entries.sort();
+    let emitted = 0;
+    for (const name of entries) {
+      if (skip.has(name)) continue;
+      if (name.startsWith('.') && name !== '.github') continue;
+      const full = join(abs, name);
+      let s;
+      try { s = statSync(full); } catch { continue; }
+      const relPath = rel ? `${rel}/${name}` : name;
+      const prefix = '  '.repeat(depth);
+      if (s.isDirectory()) {
+        lines.push(`${prefix}${name}/`);
+        walk(full, relPath, depth + 1);
+      } else if (depth === 0) {
+        lines.push(`${prefix}${name}`);
+      }
+      emitted++;
+      if (emitted >= 40) break;
+    }
+  };
+  walk(repoDir, '', 0);
+  return lines.join('\n');
 }
 
 function buildAutoExtractPrompt(sources: AutoExtractSources): string {
@@ -629,6 +854,24 @@ function buildAutoExtractPrompt(sources: AutoExtractSources): string {
       `=== Additional docs (${sources.docs.length} file(s)) ===\n` +
       sources.docs.map((d) => `--- ${d.path} ---\n${d.content}`).join('\n\n')
     );
+  }
+  if (sources.manifests.length > 0) {
+    blocks.push(
+      `=== Package manifests (${sources.manifests.length} file(s)) ===\n` +
+      sources.manifests.map((m) => `--- ${m.path} ---\n${m.content}`).join('\n\n')
+    );
+  }
+  if (sources.entry_points.length > 0) {
+    blocks.push(
+      `=== Entry-point files (${sources.entry_points.length} file(s), first ~4KB) ===\n` +
+      sources.entry_points.map((e) => `--- ${e.path} ---\n${e.content}`).join('\n\n')
+    );
+  }
+  if (sources.feature_summary) {
+    blocks.push(`=== Feature surface (routes / cron / queues / LLM callsites enumerated from source code) ===\n${sources.feature_summary}`);
+  }
+  if (sources.dir_tree) {
+    blocks.push(`=== Top-level directory tree ===\n${sources.dir_tree}`);
   }
 
   return `You are extracting a STRUCTURED "business context" for a code repository.
@@ -664,17 +907,28 @@ interface BusinessContext {
 }
 
 Guidelines:
-- Only emit critical_flows you can concretely identify from the docs.
-  Do NOT invent flows to look thorough.
-- For each flow, emit 1-5 invariants drawn from explicit rules in the
-  docs ("X must happen within 60 seconds", "user Y cannot access Z",
-  "rate limit is 100/min"). If the docs don't spell out rules for a
-  flow, emit fewer invariants rather than making them up.
-- entry_points can be rough — file paths or route patterns are both
-  fine. They're used as fuzzy hints, not as exact matches.
-- model_contracts only applies if the project calls an LLM API. Skip
-  otherwise (empty array).
-- forbidden captures "this must NEVER be true" rules.
+- You may be given any subset of: README, OpenAPI, docs, package
+  manifests, entry-point file contents, feature surface listing, and
+  directory tree. Use whatever is available — even a code-only repo
+  with no docs should yield 3-6 flows from the route list + entry
+  points + package manifest.
+- Critical flows come from the feature surface (HTTP endpoints / cron
+  jobs / queue consumers / LLM callsites). Group related endpoints
+  into a single flow when they belong to the same business concept
+  (e.g., "user_auth" covering login/signup/logout/password-reset).
+- For each flow, emit 1-5 invariants. When the README or docs state
+  an explicit rule, use it verbatim. When they don't, INFER invariants
+  from common-sense expectations for that kind of flow (rate-limit on
+  auth, idempotency on payment, ownership check on user data,
+  timeout on polling, atomicity on billing). Mark inferred ones with
+  lower severity when in doubt.
+- entry_points can be rough — file paths, handler function names, or
+  route patterns are all fine. They're used as fuzzy hints.
+- model_contracts only applies if the project calls an LLM API. If
+  feature_surface shows llm_calls, emit contracts; if not but the
+  README mentions using LLMs, still emit them. Otherwise empty array.
+- forbidden captures "this must NEVER be true" rules (hardcoded
+  secrets, unsafe subprocess calls, logging PII, etc.).
 
 OUTPUT: a single JSON object, nothing else. No prose, no markdown code
 fence. Start with { and end with }.
@@ -741,3 +995,159 @@ export function contextIsActionable(ctx: BusinessContext): boolean {
 // Touch unused imports to silence TS while keeping API clean.
 void ({} as CIRawConfig);
 void ({} as RepoProfile);
+
+// ── YAML serializer (for writing cache files) ──
+
+/**
+ * Serialize a BusinessContext back to the YAML subset this file's
+ * parser accepts. Used when writing cache files under
+ * ~/.edward/contexts/ so users can hand-edit them later.
+ *
+ * Zero-dep, deliberately minimal. Quotes strings that contain any of
+ * `:#"'-` or that would be ambiguous (true/false/null/numeric-like).
+ */
+export function serializeContextToYaml(ctx: BusinessContext): string {
+  const lines: string[] = [];
+  lines.push('# Edward business context — auto-generated or hand-edited.');
+  lines.push('# See docs/edward-context.example.yml for the full schema.');
+  lines.push('# This file lives under ~/.edward/contexts/ and is read on every');
+  lines.push('# discover run for the corresponding repo. Safe to hand-edit.');
+  lines.push('');
+
+  lines.push('project:');
+  lines.push(`  name: ${yamlString(ctx.project.name)}`);
+  lines.push(`  domain: ${yamlString(ctx.project.domain)}`);
+  lines.push(`  summary: ${yamlString(ctx.project.summary)}`);
+  lines.push('');
+
+  lines.push('critical_flows:');
+  if (ctx.critical_flows.length === 0) {
+    lines.push('  []');
+  } else {
+    for (const f of ctx.critical_flows) {
+      lines.push(`  - id: ${yamlString(f.id)}`);
+      lines.push(`    name: ${yamlString(f.name)}`);
+      lines.push(`    entry_points:`);
+      if (f.entry_points.length === 0) {
+        lines.push(`      []`);
+      } else {
+        for (const ep of f.entry_points) {
+          lines.push(`      - ${yamlString(ep)}`);
+        }
+      }
+      lines.push(`    invariants:`);
+      if (f.invariants.length === 0) {
+        lines.push(`      []`);
+      } else {
+        for (const inv of f.invariants) {
+          lines.push(`      - id: ${yamlString(inv.id)}`);
+          lines.push(`        description: ${yamlString(inv.description)}`);
+          lines.push(`        severity: ${inv.severity}`);
+        }
+      }
+    }
+  }
+  lines.push('');
+
+  lines.push('model_contracts:');
+  if (ctx.model_contracts.length === 0) {
+    lines.push('  []');
+  } else {
+    for (const c of ctx.model_contracts) {
+      lines.push(`  - library: ${yamlString(c.library)}`);
+      if (c.allowed_models && c.allowed_models.length > 0) {
+        lines.push(`    allowed_models: [${c.allowed_models.map(yamlString).join(', ')}]`);
+      }
+      if (c.param_ranges && Object.keys(c.param_ranges).length > 0) {
+        lines.push(`    param_ranges:`);
+        for (const [k, v] of Object.entries(c.param_ranges)) {
+          lines.push(`      ${k}: [${v[0]}, ${v[1]}]`);
+        }
+      }
+    }
+  }
+  lines.push('');
+
+  lines.push('forbidden:');
+  if (ctx.forbidden.length === 0) {
+    lines.push('  []');
+  } else {
+    for (const f of ctx.forbidden) {
+      lines.push(`  - ${yamlString(f)}`);
+    }
+  }
+  lines.push('');
+
+  return lines.join('\n');
+}
+
+/**
+ * Safely quote a string for the YAML subset. Always uses double
+ * quotes when in doubt. Null-safe (undefined → empty string).
+ */
+function yamlString(s: string | null | undefined): string {
+  if (s == null) return '""';
+  const str = String(s);
+  // Empty
+  if (str === '') return '""';
+  // Needs quoting if contains : # " ' [ ] { } , | > * & ! % @ `
+  // or leading/trailing whitespace, or starts with `-`, or is a reserved word
+  const reserved = new Set(['true', 'false', 'null', '~', 'yes', 'no', 'on', 'off']);
+  const needsQuote =
+    reserved.has(str.toLowerCase()) ||
+    /^-?\d+(\.\d+)?$/.test(str) ||
+    /[:#"'[\]{},|>*&!%@`]/.test(str) ||
+    /^\s|\s$/.test(str) ||
+    /^[-?,\[\]{}#&*!|>'"%@`]/.test(str) ||
+    str.includes('\n');
+  if (!needsQuote) return str;
+  // Escape backslashes + double quotes + newlines
+  const escaped = str.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+  return `"${escaped}"`;
+}
+
+// ── Context summary (for CLI display) ──
+
+export interface ContextSummary {
+  project_name: string;
+  project_domain: string;
+  flow_count: number;
+  invariant_count: number;
+  model_contract_count: number;
+  forbidden_count: number;
+  flows: Array<{
+    id: string;
+    name: string;
+    invariant_count: number;
+    invariants: Array<{ id: string; description: string; severity: InvariantSeverity }>;
+  }>;
+  source: BusinessContext['source'];
+}
+
+/**
+ * Build a human-readable summary of a context suitable for the CLI
+ * pre-scan confirmation step.
+ */
+export function summarizeContext(ctx: BusinessContext): ContextSummary {
+  const flows = ctx.critical_flows.map((f) => ({
+    id: f.id,
+    name: f.name,
+    invariant_count: f.invariants.length,
+    invariants: f.invariants.map((i) => ({
+      id: i.id,
+      description: i.description,
+      severity: i.severity,
+    })),
+  }));
+  const totalInvariants = ctx.critical_flows.reduce((a, f) => a + f.invariants.length, 0);
+  return {
+    project_name: ctx.project.name,
+    project_domain: ctx.project.domain,
+    flow_count: ctx.critical_flows.length,
+    invariant_count: totalInvariants,
+    model_contract_count: ctx.model_contracts.length,
+    forbidden_count: ctx.forbidden.length,
+    flows,
+    source: ctx.source,
+  };
+}
