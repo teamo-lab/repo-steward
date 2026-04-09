@@ -189,7 +189,13 @@ export async function runFunctionalCIAnalysis(
   const phaseBCallConfig = {
     provider: opts.provider ?? 'claude',
     model: (opts.provider === 'claude' || !opts.provider) ? 'sonnet' : undefined,
-    maxTurns: 3,
+    // maxTurns was 3 — but the claude CLI counts internal
+    // system/assistant framing turns, and on Phase B's ~20KB
+    // synthesis prompts we observed error_max_turns at turns=4.
+    // Bumping to 10 gives headroom without changing semantics
+    // (noTools=true still forbids any tool usage, so extra turns
+    // only cover framing, not exploration).
+    maxTurns: 10,
     maxBudgetUsd: 1.5,
     timeoutMs: 240_000,
     // Pure code-generation task — style samples and target invariants
@@ -210,19 +216,39 @@ export async function runFunctionalCIAnalysis(
 
   for (const batch of batches) {
     const prompt = buildSynthPrompt(ctx, batch, styleSamples, allInvariants, opts.preferredExt);
-    const r = await invokeLLMWithFallback(
-      prompt,
-      repoDir,
-      phaseBCallConfig,
-      { allowFallback: opts.allowFallback !== false }
-    );
-    result.diagnostics.phase_b_cost_usd += r.costUsd;
-    result.diagnostics.phase_b_duration_ms += r.durationMs;
-    if (!r.ok) {
-      // One failing batch is not fatal — record what we have so far
-      // and keep going. The caller can see partial results.
+    // Local retry ladder: the claude CLI's is_error=true envelope is
+    // usually transient (Anthropic overload / rate limit / max-turns
+    // with empty output). Previously a single failed call abandoned
+    // the whole batch of 5 invariants — observed 4/6 batches failing
+    // on ama-user-service. Two quick retries with backoff recover
+    // most of those without touching the fallback provider.
+    const MAX_ATTEMPTS = 3;
+    let r: Awaited<ReturnType<typeof invokeLLMWithFallback>> | null = null;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      r = await invokeLLMWithFallback(
+        prompt,
+        repoDir,
+        phaseBCallConfig,
+        { allowFallback: opts.allowFallback !== false }
+      );
+      result.diagnostics.phase_b_cost_usd += r.costUsd;
+      result.diagnostics.phase_b_duration_ms += r.durationMs;
+      if (r.ok) break;
+      if (attempt < MAX_ATTEMPTS) {
+        const backoffMs = 2_000 * attempt;
+        console.error(
+          `[edward] functional-ci synth batch attempt ${attempt}/${MAX_ATTEMPTS} failed ` +
+          `(${r.error?.slice(0, 160) || 'unknown'}); retrying in ${backoffMs}ms`
+        );
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+      }
+    }
+    if (!r || !r.ok) {
+      // Even after retries + fallback, this batch is dead. Record
+      // and continue so the caller still gets partial results.
       console.error(
-        `[edward] functional-ci synth batch failed: ${r.error?.slice(0, 200) || 'unknown'}`
+        `[edward] functional-ci synth batch permanently failed after ${MAX_ATTEMPTS} attempts: ` +
+        `${r?.error?.slice(0, 200) || 'unknown'}`
       );
       continue;
     }

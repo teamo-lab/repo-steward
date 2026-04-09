@@ -121,6 +121,13 @@ export function isRetriableLLMError(err: string | undefined): boolean {
     'non-json output',
     'claude exited', 'codex exited',
     'sigterm', 'killed',
+    // Claude CLI envelope errors — these are usually transient
+    // Anthropic API failures (overload, rate limit, max-turns hit
+    // with empty output) surfacing through the CLI's JSON error
+    // envelope. Phase B was losing 4/6 batches because this class
+    // of error wasn't being retried or handed off to the fallback
+    // provider.
+    'is_error', 'no result text',
   ];
   return retriable.some(m => s.includes(m));
 }
@@ -562,6 +569,18 @@ async function spawnClaude(
 
   const costUsd = typeof parsed?.total_cost_usd === 'number' ? parsed.total_cost_usd : 0;
   if (parsed?.is_error || !parsed?.result) {
+    // Build a richer error string so fallback + future debugging
+    // can see WHY claude bailed. The CLI's error envelope often
+    // carries `error.type` / `subtype` / `duration_api_ms` that
+    // identify the real cause (overload/rate-limit/max-turns).
+    const envelopeHints: string[] = [];
+    if (parsed?.error?.type) envelopeHints.push(`type=${parsed.error.type}`);
+    if (parsed?.error?.subtype) envelopeHints.push(`subtype=${parsed.error.subtype}`);
+    if (parsed?.error?.message) envelopeHints.push(`msg=${String(parsed.error.message).slice(0, 160)}`);
+    if (parsed?.subtype) envelopeHints.push(`envelope_subtype=${parsed.subtype}`);
+    if (typeof parsed?.num_turns === 'number') envelopeHints.push(`turns=${parsed.num_turns}`);
+    if (typeof parsed?.duration_api_ms === 'number') envelopeHints.push(`api_ms=${parsed.duration_api_ms}`);
+    const hintStr = envelopeHints.length > 0 ? ` [${envelopeHints.join(' ')}]` : '';
     return {
       ok: false,
       stdout: '',
@@ -569,8 +588,8 @@ async function spawnClaude(
       durationMs: duration,
       attempts: 1,
       error: typeof parsed?.result === 'string'
-        ? parsed.result.slice(0, 500)
-        : 'claude returned is_error=true with no result text',
+        ? parsed.result.slice(0, 500) + hintStr
+        : `claude returned is_error=true with no result text${hintStr}`,
     };
   }
 
