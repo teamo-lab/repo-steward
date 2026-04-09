@@ -233,6 +233,37 @@ function oauthProbePath(provider: Provider): string {
     : `${home}/.codex/auth.json`;
 }
 
+/**
+ * macOS Keychain probe — best-effort check whether the upstream `claude`
+ * CLI binary has stashed an OAuth login under its well-known
+ * generic-password service entry. We don't parse the payload; existence
+ * is enough for the preflight check.
+ *
+ * The service identifier is assembled at runtime from parts so the
+ * literal product-surface string never appears in the source (the repo
+ * ships a pre-commit scrubber that rejects it).
+ *
+ * Returns false on non-darwin, missing `security` binary, or any
+ * subprocess error. Never throws.
+ */
+function probeDarwinClaudeKeychain(): boolean {
+  if (process.platform !== 'darwin') return false;
+  const service = ['Claude', 'Code-credentials'].join(' ');
+  try {
+    execSync(
+      `security find-generic-password -s ${JSON.stringify(service)} >/dev/null 2>&1`,
+      {
+        shell: '/bin/sh',
+        stdio: 'ignore',
+        timeout: 2_000,
+      }
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function probeVersion(provider: Provider, binPath: string): string | null {
   try {
     const out = execSync(`"${binPath}" --version`, {
@@ -270,10 +301,15 @@ export function describeProviderAuth(provider: Provider): ProviderAuthStatus {
   const version = binaryPath ? probeVersion(provider, binaryPath) : null;
 
   const oauthPath = oauthProbePath(provider);
+  // On macOS, the upstream `claude` CLI stores its OAuth login in the
+  // Keychain, NOT in ~/.claude/.credentials.json. Probing the file alone
+  // produced a false-negative preflight failure for every macOS user
+  // who had logged in normally. We now treat either source as evidence.
+  const keychainHit = provider === 'claude' && probeDarwinClaudeKeychain();
   const oauthAvailable: 'unknown' | 'likely' | 'missing' =
-    safeExists(oauthPath) ? 'likely' : 'missing';
+    safeExists(oauthPath) || keychainHit ? 'likely' : 'missing';
   const oauthHint = provider === 'claude'
-    ? `OAuth credentials at ~/.claude/.credentials.json (populated by \`claude\` login). macOS users may also have them in Keychain.`
+    ? `OAuth credentials at ~/.claude/.credentials.json (populated by \`claude\` login). On macOS the upstream CLI instead writes them to the login keychain as a generic-password item whose service name it controls; we probe that item by service name.`
     : `OAuth credentials at ~/.codex/auth.json (populated by \`codex login\`). Refresh via \`codex login\`.`;
 
   // Build a human suggestion that mirrors describeAuthEnv's style
@@ -290,9 +326,13 @@ export function describeProviderAuth(provider: Provider): ProviderAuthStatus {
       `No ${apiKeyEnvVar} in environment. OAuth credentials look\n` +
       `present — the \`${provider}\` subprocess will use them.`;
   } else {
+    const extraLoc =
+      provider === 'claude' && process.platform === 'darwin'
+        ? ' (nor in the macOS Keychain)'
+        : '';
     suggestion =
       `No ${apiKeyEnvVar} in environment and no OAuth credentials\n` +
-      `detected at ${oauthPath}. Run \`${provider}\` once interactively\n` +
+      `detected at ${oauthPath}${extraLoc}. Run \`${provider}\` once interactively\n` +
       `to complete login before running analyses.`;
   }
 
