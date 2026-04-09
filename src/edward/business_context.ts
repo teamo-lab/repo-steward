@@ -605,9 +605,13 @@ export async function autoExtractContext(
     {
       provider: provider ?? 'claude',
       model: provider === 'claude' || !provider ? 'sonnet' : undefined,
-      maxTurns: 6,
+      maxTurns: 3,
       maxBudgetUsd: 0.5,
-      timeoutMs: 240_000,
+      timeoutMs: 180_000,
+      // Pure extraction over inlined doc snippets — no agent tools
+      // needed. Prevents the claude-hangs-exploring-cwd bug on
+      // large repos.
+      noTools: true,
     },
     { allowFallback: true }
   );

@@ -2201,6 +2201,22 @@ export function startEdwardServer(port = 8080): void {
   });
   console.log(`\n  ◆ Edward Dashboard: http://localhost:${server.port}/`);
   console.log(`    API: http://localhost:${server.port}/api/v1/repos\n`);
+
+  // Surface the effective auth configuration so operators can verify
+  // which LLM account this server session is actually billing to.
+  // cli.ts preflightAuth sets these before spawning the server.
+  const activeProvider = process.env.EDWARD_PROVIDER || 'claude';
+  const authMode = process.env.EDWARD_AUTH_MODE || 'default';
+  console.log(`  [edward] active provider: ${activeProvider}  auth: ${authMode}`);
+  if (activeProvider === 'claude' && authMode === 'oauth') {
+    console.log(`  [edward] claude subprocesses will use OAuth credentials (ANTHROPIC_API_KEY stripped from child env)`);
+  } else if (activeProvider === 'claude' && authMode === 'api_key') {
+    console.log(`  [edward] claude subprocesses will bill to ANTHROPIC_API_KEY (Console account)`);
+  } else if (activeProvider === 'codex') {
+    console.log(`  [edward] codex subprocesses will use ChatGPT OAuth (~/.codex/auth.json)`);
+  }
+  console.log();
+
   // Fire-and-forget seed load — never blocks startup, never crashes the server.
   loadSeedFile().catch((err) => console.error(`[edward] seed: load crashed: ${err?.message || err}`));
 }

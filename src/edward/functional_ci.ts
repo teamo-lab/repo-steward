@@ -142,9 +142,14 @@ export async function runFunctionalCIAnalysis(
   const phaseACallConfig = {
     provider: opts.provider ?? 'claude',
     model: (opts.provider === 'claude' || !opts.provider) ? 'sonnet' : undefined,
-    maxTurns: 10,
+    maxTurns: 3,
     maxBudgetUsd: 0.75,
     timeoutMs: 240_000,
+    // Pure reasoning over inlined JSON inputs — claude does not need
+    // to explore the cwd. Without noTools=true, claude hangs trying
+    // to Read/Grep the target repo instead of emitting the judgment
+    // object. See llm_provider.ts spawnClaude for the full rationale.
+    noTools: true,
   } as const;
 
   const phaseAPrompt = buildCoveragePrompt(ctx, surface, coverage);
@@ -184,9 +189,14 @@ export async function runFunctionalCIAnalysis(
   const phaseBCallConfig = {
     provider: opts.provider ?? 'claude',
     model: (opts.provider === 'claude' || !opts.provider) ? 'sonnet' : undefined,
-    maxTurns: 20,
+    maxTurns: 3,
     maxBudgetUsd: 1.5,
-    timeoutMs: 420_000,
+    timeoutMs: 240_000,
+    // Pure code-generation task — style samples and target invariants
+    // are inlined in the prompt, so there is no value in letting
+    // claude read the cwd. noTools=true prevents the agent-mode
+    // hang/timeout we observed previously.
+    noTools: true,
   } as const;
 
   // Batch uncovered invariants into groups of 5 to keep prompts focused

@@ -53,6 +53,19 @@ export interface LLMProviderConfig {
   maxBudgetUsd?: number;
   /** Spawn-level wall-clock timeout in milliseconds. Applied to both providers. */
   timeoutMs?: number;
+  /**
+   * If true, disable all agent tools on the claude side (passes
+   * `--tools ""`). Use for pure generation / reasoning tasks that
+   * don't need to explore the target repo. Codex doesn't have an
+   * equivalent knob and is unaffected.
+   *
+   * Without this, claude defaults to full tool access (Read / Bash /
+   * Grep / etc) and may spend its turn budget exploring the cwd
+   * instead of producing output. On large repos this manifests as
+   * `claude hangs for the entire timeout and returns empty stdout`,
+   * a bug observed on ama-user-service with ~20KB Phase-B prompts.
+   */
+  noTools?: boolean;
 }
 
 export interface LLMCallResult {
@@ -482,6 +495,17 @@ async function spawnClaude(
   delete env.CLAUDECODE;
   delete env.CLAUDE_CODE_ENTRYPOINT;
 
+  // Honor the startup auth-mode selection. When the user picked
+  // "Claude OAuth" at `edward serve` start, cli.ts sets
+  // EDWARD_AUTH_MODE=oauth. We strip ANTHROPIC_API_KEY from the
+  // CHILD env so the claude CLI falls back to OAuth credentials
+  // (Keychain on macOS, ~/.claude/.credentials.json elsewhere).
+  // The parent shell's env is untouched — we only modify this
+  // copy before passing it to spawn().
+  if (process.env.EDWARD_AUTH_MODE === 'oauth') {
+    delete env.ANTHROPIC_API_KEY;
+  }
+
   const args = [
     '-p', prompt,
     '--output-format', 'json',
@@ -491,6 +515,17 @@ async function spawnClaude(
     '--max-turns', String(cfg.maxTurns ?? 40),
     '--max-budget-usd', String(cfg.maxBudgetUsd ?? 5),
   ];
+  // Pure text-generation callers (business context extract, functional
+  // CI gap analysis + test synthesis) pass noTools=true to disable the
+  // full agent tool stack. Without this, claude spends its turn budget
+  // exploring the cwd with Read/Bash/Grep instead of producing output,
+  // and on large repos ends up hanging until the spawn timeout kills
+  // it with zero bytes on stdout. Verified on ama-user-service: a
+  // ~20KB Phase B prompt went from 420s timeout (hang) to 7.7s with
+  // `--tools ""`.
+  if (cfg.noTools) {
+    args.push('--tools', '');
+  }
 
   const stdout = await new Promise<string>((resolve, reject) => {
     const proc = spawn(binPath, args, {

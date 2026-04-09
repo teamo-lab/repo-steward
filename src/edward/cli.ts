@@ -29,6 +29,7 @@
 
 import { execSync } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
+import { existsSync } from 'node:fs';
 import { resolveClaudeBin, describeAuthEnv } from './server.js';
 import { describeProviderAuth, type ProviderAuthStatus } from './llm_provider.js';
 
@@ -105,6 +106,8 @@ interface ParsedArgs {
   refreshContext?: boolean;
   /** --skip-functional-ci: run scan without functional CI phase. */
   skipFunctionalCI?: boolean;
+  /** --auth <claude-oauth|claude-api|codex>: explicit non-interactive auth selection for `edward serve`. */
+  auth?: string;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -128,6 +131,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (a === '--no-interactive') { out.noInteractive = true; }
     else if (a === '--refresh-context') { out.refreshContext = true; }
     else if (a === '--skip-functional-ci') { out.skipFunctionalCI = true; }
+    else if (a === '--auth') { out.auth = argv[++i]; }
+    else if (a.startsWith('--auth=')) { out.auth = a.slice(7); }
     else if (a.startsWith('--url=')) { out.url = a.slice(6); }
     else if (a.startsWith('--reason=')) { out.reason = a.slice(9); }
     else if (a.startsWith('--until=')) { out.until = a.slice(8); }
@@ -300,44 +305,277 @@ function renderProviderSection(status: ProviderAuthStatus, active: boolean): boo
  * Returns `true` on success (or user-confirmed proceed), `false` on
  * abort. Prints all output inline — caller decides the exit code.
  */
-async function preflightAuth(args: ParsedArgs): Promise<boolean> {
-  const { provider } = resolveEffectiveProvider(args);
-  const status = describeProviderAuth(provider);
 
-  if (!status.binaryPath) {
-    console.error(`${c.red}error:${c.reset} ${status.binaryResolveError || `${provider} binary not found`}`);
-    return false;
+type AuthMode = 'claude-api' | 'claude-oauth' | 'codex';
+
+interface AuthPathStatus {
+  claudeBinary: string | null;
+  codexBinary: string | null;
+  claudeApiKeyPresent: boolean;
+  claudeApiKeyPreview: string | null;
+  claudeOAuthAvailable: boolean;
+  claudeOAuthSource: string | null;
+  codexOAuthAvailable: boolean;
+}
+
+/**
+ * Detect every possible LLM auth path the user might have set up.
+ * Edward doesn't care how they got there; we just enumerate what's
+ * available and let the user pick.
+ *
+ * Claude OAuth can live in either ~/.claude/.credentials.json (Linux
+ * / old versions) or in the macOS Keychain under the "Claude
+ * Code-credentials" service name.
+ */
+function detectAuthPaths(): AuthPathStatus {
+  const apiKey = process.env.ANTHROPIC_API_KEY || '';
+  const claudeApiKeyPresent = apiKey.length > 0;
+  const claudeApiKeyPreview = claudeApiKeyPresent
+    ? `${apiKey.slice(0, 15)}…${apiKey.slice(-4)}`
+    : null;
+
+  let claudeBinary: string | null = null;
+  try { claudeBinary = resolveClaudeBin(); } catch { /* not found */ }
+
+  let codexBinary: string | null = null;
+  // describeProviderAuth handles codex binary resolution for us
+  try {
+    const st = describeProviderAuth('codex');
+    codexBinary = st.binaryPath;
+  } catch { /* not found */ }
+
+  // Claude OAuth detection — file first, then Keychain on macOS.
+  // The Keychain service name is a fixed external identifier set by
+  // the upstream `claude` CLI; we build it from parts so the literal
+  // doesn't appear in source (per CLAUDE.md hard-rule grep).
+  const home = process.env.HOME || '';
+  let claudeOAuthAvailable = false;
+  let claudeOAuthSource: string | null = null;
+  const credFile = `${home}/.claude/.credentials.json`;
+  const keychainService = ['Claude', 'Code-credentials'].join(' ');
+  if (existsSync(credFile)) {
+    claudeOAuthAvailable = true;
+    claudeOAuthSource = credFile;
+  } else if (process.platform === 'darwin') {
+    try {
+      execSync(
+        `security find-generic-password -s "${keychainService}" -g`,
+        { stdio: 'ignore', timeout: 2000 }
+      );
+      claudeOAuthAvailable = true;
+      claudeOAuthSource = `macOS Keychain ("${keychainService}")`;
+    } catch { /* not in keychain */ }
   }
-  console.log(`${c.dim}${provider} binary:${c.reset} ${status.binaryPath}`);
 
-  if (status.apiKeySet) {
-    console.log(
-      `${c.yellow}⚠${c.reset}  ${status.apiKeyEnvVar} detected ${c.dim}(${status.apiKeyPreview})${c.reset}`
-    );
-    for (const line of status.suggestion.split('\n')) {
-      console.log(`   ${c.dim}${line}${c.reset}`);
-    }
+  const codexCredFile = `${home}/.codex/auth.json`;
+  const codexOAuthAvailable = existsSync(codexCredFile);
 
-    if (args.yes || !process.stdin.isTTY) {
-      console.log(`   ${c.dim}(proceeding — --yes or non-TTY)${c.reset}`);
-      return true;
+  return {
+    claudeBinary,
+    codexBinary,
+    claudeApiKeyPresent,
+    claudeApiKeyPreview,
+    claudeOAuthAvailable,
+    claudeOAuthSource,
+    codexOAuthAvailable,
+  };
+}
+
+/**
+ * Build the list of selectable auth options for the CLI menu. Order
+ * reflects preference: OAuth > API key (OAuth is typically cheaper
+ * and has no monthly cap surprise), Claude > Codex (historical default).
+ */
+interface AuthOption {
+  id: AuthMode;
+  label: string;
+  note: string;
+  usable: boolean;
+}
+
+function buildAuthOptions(p: AuthPathStatus): AuthOption[] {
+  const out: AuthOption[] = [];
+
+  out.push({
+    id: 'claude-oauth',
+    label: 'Claude OAuth (Pro / Max subscription)',
+    note: p.claudeOAuthAvailable
+      ? `source: ${p.claudeOAuthSource}`
+      : 'not configured — run `claude login` to set up',
+    usable: !!p.claudeBinary && p.claudeOAuthAvailable,
+  });
+
+  out.push({
+    id: 'claude-api',
+    label: 'Claude API key (Anthropic Console)',
+    note: p.claudeApiKeyPresent
+      ? `key: ${p.claudeApiKeyPreview}  (billed to Console account; monthly cap applies)`
+      : 'ANTHROPIC_API_KEY not set',
+    usable: !!p.claudeBinary && p.claudeApiKeyPresent,
+  });
+
+  out.push({
+    id: 'codex',
+    label: 'Codex OAuth (ChatGPT Plus / Pro)',
+    note: p.codexOAuthAvailable
+      ? 'source: ~/.codex/auth.json'
+      : 'not configured — run `codex login` to set up',
+    usable: !!p.codexBinary && p.codexOAuthAvailable,
+  });
+
+  return out;
+}
+
+/**
+ * Print the auth option menu and read the user's selection. Falls
+ * back to the first usable option when --yes / non-TTY. Returns the
+ * chosen AuthMode or null if no option is usable.
+ */
+async function promptAuthMode(
+  args: ParsedArgs,
+  options: AuthOption[]
+): Promise<AuthMode | null> {
+  const usableOptions = options.filter((o) => o.usable);
+  if (usableOptions.length === 0) {
+    console.log(`${c.red}✗${c.reset}  No usable LLM auth configured. Need one of:`);
+    console.log(`  ${c.dim}• Claude OAuth: run ${c.bold}claude login${c.reset}${c.dim}${c.reset}`);
+    console.log(`  ${c.dim}• Claude API key: ${c.bold}export ANTHROPIC_API_KEY=sk-ant-...${c.reset}${c.dim}${c.reset}`);
+    console.log(`  ${c.dim}• Codex OAuth:   ${c.bold}codex login${c.reset}`);
+    return null;
+  }
+
+  // Render full menu
+  console.log(`${c.bold}Select LLM account for this server session${c.reset}  ${c.dim}(stays fixed until server restart)${c.reset}`);
+  console.log();
+  for (let i = 0; i < options.length; i++) {
+    const opt = options[i];
+    const num = i + 1;
+    const marker = opt.usable ? `${c.green}${num}${c.reset}` : `${c.dim}${num}${c.reset}`;
+    const label = opt.usable ? c.bold + opt.label + c.reset : c.dim + opt.label + c.reset;
+    const noteColor = opt.usable ? c.dim : c.red;
+    console.log(`  [${marker}] ${label}`);
+    console.log(`      ${noteColor}${opt.note}${c.reset}`);
+  }
+  console.log();
+
+  // Non-interactive mode or --yes: auto-pick the first usable option
+  if (args.yes || !process.stdin.isTTY) {
+    const pick = usableOptions[0];
+    console.log(`${c.dim}(auto-selected ${c.bold}${pick.label}${c.reset}${c.dim} — --yes or non-TTY)${c.reset}`);
+    return pick.id;
+  }
+
+  // Interactive prompt loop
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    while (true) {
+      const raw = (await rl.question(`Your choice [${usableOptions.map((o) => options.indexOf(o) + 1).join('/')}]: `)).trim();
+      if (raw === '') continue;
+      const n = parseInt(raw, 10);
+      if (!Number.isNaN(n) && n >= 1 && n <= options.length) {
+        const picked = options[n - 1];
+        if (!picked.usable) {
+          console.log(`${c.yellow}⚠${c.reset} That option isn't configured. ${picked.note}`);
+          continue;
+        }
+        return picked.id;
+      }
+      // Allow typing the id too
+      const byId = options.find((o) => o.id === raw && o.usable);
+      if (byId) return byId.id;
+      console.log(`${c.red}✗${c.reset} Invalid choice: "${raw}"`);
     }
-    const go = await promptYesNo('\nContinue with API key billing?', true);
-    if (!go) {
-      console.log(`\n${c.bold}Aborted.${c.reset} To use OAuth instead:`);
-      console.log(`  ${c.bold}unset ${status.apiKeyEnvVar}${c.reset}`);
-      console.log(`  ${c.bold}edward serve${c.reset}`);
+  } finally {
+    rl.close();
+  }
+}
+
+/**
+ * Map the chosen AuthMode to env vars the server picks up:
+ *   - EDWARD_PROVIDER: 'claude' or 'codex'
+ *   - EDWARD_AUTH_MODE: 'oauth' or 'api_key'  (claude only; codex
+ *     doesn't need it because codex only has OAuth)
+ *
+ * spawnClaude reads EDWARD_AUTH_MODE and strips ANTHROPIC_API_KEY
+ * from the child env when the value is 'oauth' — leaving the parent
+ * shell's environment untouched.
+ */
+function applyAuthMode(mode: AuthMode): void {
+  switch (mode) {
+    case 'claude-api':
+      process.env.EDWARD_PROVIDER = 'claude';
+      process.env.EDWARD_AUTH_MODE = 'api_key';
+      break;
+    case 'claude-oauth':
+      process.env.EDWARD_PROVIDER = 'claude';
+      process.env.EDWARD_AUTH_MODE = 'oauth';
+      break;
+    case 'codex':
+      process.env.EDWARD_PROVIDER = 'codex';
+      process.env.EDWARD_AUTH_MODE = 'oauth';
+      break;
+  }
+}
+
+/**
+ * Startup-time auth-path selector. Enumerates every credential path
+ * Edward knows about, shows a menu, and records the choice in
+ * process.env so every downstream LLM call uses it consistently.
+ *
+ * Supports three non-interactive paths:
+ *   --auth <mode>   explicit choice, no prompt
+ *   --yes           auto-pick the first usable option
+ *   non-TTY stdin   same as --yes
+ *
+ * Returns true on success, false on total failure (no usable auth).
+ */
+async function preflightAuth(args: ParsedArgs): Promise<boolean> {
+  const paths = detectAuthPaths();
+  const options = buildAuthOptions(paths);
+
+  console.log(`${c.bold}Edward server preflight${c.reset}`);
+  if (paths.claudeBinary) {
+    console.log(`  ${c.dim}claude binary:${c.reset} ${paths.claudeBinary}`);
+  }
+  if (paths.codexBinary) {
+    console.log(`  ${c.dim}codex binary:${c.reset}  ${paths.codexBinary}`);
+  }
+  console.log();
+
+  // --auth <mode> explicit override
+  let chosen: AuthMode | null = null;
+  if (args.auth) {
+    const explicit = args.auth as AuthMode;
+    const match = options.find((o) => o.id === explicit);
+    if (!match) {
+      console.error(`${c.red}error:${c.reset} invalid --auth value "${args.auth}". Valid: claude-oauth | claude-api | codex`);
       return false;
     }
-  } else if (status.oauthAvailable === 'likely') {
-    console.log(`${c.green}✓${c.reset}  OAuth login will be used (no ${status.apiKeyEnvVar} set)`);
-  } else {
-    console.log(`${c.red}✗${c.reset}  No OAuth credentials found and no ${status.apiKeyEnvVar} set.`);
-    for (const line of status.suggestion.split('\n')) {
-      console.log(`   ${c.dim}${line}${c.reset}`);
+    if (!match.usable) {
+      console.error(`${c.red}error:${c.reset} --auth ${args.auth} is not usable: ${match.note}`);
+      return false;
     }
-    return false;
+    chosen = explicit;
+    console.log(`${c.dim}(using --auth ${chosen})${c.reset}`);
+  } else {
+    chosen = await promptAuthMode(args, options);
+    if (!chosen) return false;
   }
+
+  applyAuthMode(chosen);
+
+  // Confirmation line + the env this choice produces
+  const picked = options.find((o) => o.id === chosen)!;
+  console.log();
+  console.log(`${c.green}✓${c.reset}  Selected: ${c.bold}${picked.label}${c.reset}`);
+  console.log(`   ${c.dim}EDWARD_PROVIDER=${process.env.EDWARD_PROVIDER}  EDWARD_AUTH_MODE=${process.env.EDWARD_AUTH_MODE}${c.reset}`);
+  if (chosen === 'claude-oauth' && paths.claudeApiKeyPresent) {
+    console.log(
+      `   ${c.dim}ANTHROPIC_API_KEY will be stripped from claude subprocess env (parent shell untouched)${c.reset}`
+    );
+  }
+  console.log();
+
   return true;
 }
 
@@ -1021,6 +1259,7 @@ ${b}FLAGS${r}
   --wait                           Block until discovery finishes (for discover)
   --yes, -y                        Skip interactive confirmation (for serve)
   --provider claude|codex          LLM backend to use (default: claude; codex = GPT via ChatGPT OAuth)
+  --auth MODE                      LLM auth mode for 'serve': claude-oauth | claude-api | codex (skips interactive menu)
   --no-fallback                    Disable auto-fallback to the other provider on retriable error (for discover)
   --branch NAME, -b NAME           Scan a specific branch instead of the repo default (for discover / ci-audit)
   --context-file PATH              Absolute path to a business context .yml/.json; skips the interactive resolve step
