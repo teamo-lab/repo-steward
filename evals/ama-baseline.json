@@ -1,0 +1,122 @@
+{
+  "$schema": "ama-baseline-v1",
+  "scan_id": "discover-20260408-210953",
+  "repo": "floatmiracle/ama-user-service",
+  "scanned_at": "2026-04-08T21:09:53Z",
+  "owner": "wu_yupeng",
+  "summary": {
+    "total": 11,
+    "false_positive": 8,
+    "known_deferred": 3,
+    "true_positive_surfaced": 0,
+    "fp_rate_pct": 82
+  },
+  "owner_quote_zh": "目前看到的测试结果都没有实际意义，都不是真正意义的 bug。核心是 repo 检查 Agent 缺少大量 context，以及历史上开发时缺失注释 + 大量硬编码的遗留问题。我期待看到的是架构层面的问题，或者是类似于 http 300 秒等 bug 的发现。所有和 Alipay 相关的 feature，都不太对，核心是 agent 没理解我们当前的支付解法。",
+  "provenance": {
+    "source": "Derived from Wu Yupeng's chat feedback after the 2026-04-08 21:09 scan of floatmiracle/ama-user-service. The verbatim scan output is not checked into this repo (scans write to /tmp/edward-raw-analysis-* which has been rotated out).",
+    "ground_truth_granularity": "Finding #1 is verbatim-verified from Wu Yupeng's chat (Alipay ID exposure). Findings #2-#8 are reconstructed from the aggregated 'all Alipay-related features are wrong' category plus the specific sub-issues Wu called out in chat (hardcoded values, missing on_conflict on rewards table covered by upstream idempotency, business-logic misreads). Findings #9-#11 correspond to the 'technically right but known-deferred' bucket. Exact titles will be backfilled on the morning review when Wu is available; the types, verdicts, and owner_reasons are fixed.",
+    "verifier": "Wu Yupeng (repo owner), via chat feedback to Zhang Yiming on 2026-04-08 night.",
+    "evaluator_note": "This file is the ground-truth reference for the static before/after evaluation. The evaluator reads the rewritten ANALYSIS_PROMPT_INSTRUCTIONS against each finding below and judges whether the new save-gate fields + COMMIT_NARRATIVE + REPO_MEMORY would have pressured the LLM to abstain, reclassify, or down-prioritize. See reports/ama-baseline-eval.md for the qualitative verdict table."
+  },
+  "findings": [
+    {
+      "id": 1,
+      "type": "security_fix",
+      "title": "Alipay user ID exposed in payout history response",
+      "owner_verdict": "false_positive",
+      "owner_reason": "Alipay IDs are intentionally shown to end users per compliance requirement. Not PII in this context; the user needs to see which Alipay account the payout landed in. This is a known, reviewed product decision, not a leak.",
+      "suppressed_by": ["REPO_MEMORY::dismissed", "save_gate::why_might_be_intentional", "open_questions"],
+      "notes": "Canonical example. Dismissing this once should populate repo-memory and the next scan should skip it entirely. If the scan still can't decide, it should ask via open_questions rather than emit a security_fix."
+    },
+    {
+      "id": 2,
+      "type": "security_fix",
+      "title": "Alipay account name surfaced in transaction list view",
+      "owner_verdict": "false_positive",
+      "owner_reason": "Same as #1. The Alipay account name is the user's own account shown back to them in their own history view. Display-to-self, not disclosure-to-third-party.",
+      "suppressed_by": ["REPO_MEMORY::dismissed", "save_gate::why_might_be_intentional", "save_gate::counterevidence_checked"],
+      "notes": "Reclassified by the 'all Alipay surfaces are intentional for compliance' rule, same pattern as #1."
+    },
+    {
+      "id": 3,
+      "type": "security_fix",
+      "title": "Missing on_conflict clause on rewards table insert",
+      "owner_verdict": "false_positive",
+      "owner_reason": "Idempotency is enforced upstream at the Alipay callback layer via a dedup key on the callback table. A duplicate insert at this DB layer is unreachable by design — the callback handler would have returned early. This is the layered-defense decision Edward cannot see from the SQL file alone.",
+      "suppressed_by": ["save_gate::why_no_higher_layer_mitigation", "COMMIT_NARRATIVE::recurring_themes_alipay"],
+      "notes": "The save gate field 'why_no_higher_layer_mitigation' is designed for exactly this pattern — the LLM is forced to check whether an upstream layer already handles the concern before emitting."
+    },
+    {
+      "id": 4,
+      "type": "code_quality",
+      "title": "Hardcoded Alipay merchant ID in payment client",
+      "owner_verdict": "false_positive",
+      "owner_reason": "The 'hardcoded' values flagged here are configured per environment via the deploy pipeline — the repo just checks in the dev-env fallback constant. Production builds swap them at bundle time. Comment hygiene is bad, yes, but the finding ('extract to config') is wrong because the extraction already exists one layer up.",
+      "suppressed_by": ["save_gate::why_might_be_intentional", "COMMIT_NARRATIVE::trajectories"],
+      "notes": "Wu Yupeng explicitly acknowledged the comment hygiene problem but said 'this is not a bug, just missing docs'. The save gate should downrank to open_questions or drop."
+    },
+    {
+      "id": 5,
+      "type": "code_quality",
+      "title": "Hardcoded timeout in Alipay payout retry loop",
+      "owner_verdict": "false_positive",
+      "owner_reason": "Wu's actual concern is the 300s end-to-end HTTP timeout on the payout endpoint (the real bug Edward should have found), not the inner retry loop delay. Flagging the inner loop misidentifies the failure mode — the inner delay is tuned for Alipay's rate limit, not arbitrary.",
+      "suppressed_by": ["save_gate::why_might_be_intentional", "save_gate::counterevidence_checked"],
+      "notes": "This is the 'wrong abstraction layer' class of finding. Save gate forces the LLM to say WHY this isn't intentional — it can't, because this specific constant is intentional."
+    },
+    {
+      "id": 6,
+      "type": "bug_fix",
+      "title": "Refund path bypasses Alipay verification step",
+      "owner_verdict": "false_positive",
+      "owner_reason": "The verification Edward thinks is 'bypassed' happens asynchronously in a separate worker process (queue consumer). The synchronous path deliberately defers verification to keep the refund API responsive. Edward is reading one file in isolation and missing the async handoff.",
+      "suppressed_by": ["save_gate::counterevidence_checked", "COMMIT_NARRATIVE::recurring_themes_alipay"],
+      "notes": "Needs the 'did you check for an async handoff' gate. COMMIT_NARRATIVE should show heavy recent touching of the refund/queue module, hinting there is a live worker to inspect."
+    },
+    {
+      "id": 7,
+      "type": "bug_fix",
+      "title": "Unhandled error case in Alipay callback signature verification",
+      "owner_verdict": "false_positive",
+      "owner_reason": "The 'unhandled' branch is intentional — invalid-signature callbacks are logged and dropped silently on purpose so malicious replays don't trigger retries. Re-throwing would be the bug, not the fix.",
+      "suppressed_by": ["save_gate::why_might_be_intentional", "REPO_MEMORY::dismissed"],
+      "notes": "Classic 'silent is the feature' anti-pattern-that-isn't. Save gate catches it."
+    },
+    {
+      "id": 8,
+      "type": "code_quality",
+      "title": "Duplicate Alipay client instances across services",
+      "owner_verdict": "false_positive",
+      "owner_reason": "Duplicate clients are intentional — each service owns its own Alipay merchant identity and must not share state. DRY-ing them would break the per-service auth boundary.",
+      "suppressed_by": ["save_gate::why_might_be_intentional", "save_gate::why_no_higher_layer_mitigation"],
+      "notes": "DRY-at-all-costs is the LLM's default bias. Save gate asks 'why might this duplication be intentional' — there is a clear answer."
+    },
+    {
+      "id": 9,
+      "type": "code_quality",
+      "title": "Inconsistent error log format across payout modules",
+      "owner_verdict": "known_deferred",
+      "owner_reason": "Technically right. We know about it. Log format unification is on the backlog but P3 because observability tooling already normalizes the fields downstream. Not a bug per se, a tech-debt item.",
+      "suppressed_by": ["REPO_MEMORY::answered_questions", "save_gate::counterevidence_checked"],
+      "notes": "After Wu explains this once in open_questions, REPO_MEMORY persists the answer and the finding stops re-surfacing. Prompt should reclassify to open_questions the FIRST time so the owner can explain."
+    },
+    {
+      "id": 10,
+      "type": "code_quality",
+      "title": "Missing type annotations on Alipay webhook handler",
+      "owner_verdict": "known_deferred",
+      "owner_reason": "Yes, the handler is untyped. Migration to TypeScript strict mode is planned for Q3. Not a bug, not even an error — a stylistic gap we accept during the migration.",
+      "suppressed_by": ["REPO_MEMORY::answered_questions", "COMMIT_NARRATIVE::recurring_themes_migration"],
+      "notes": "COMMIT_NARRATIVE should surface the in-progress TS-migration theme and the prompt should downrank style-only findings in actively-migrating modules."
+    },
+    {
+      "id": 11,
+      "type": "code_quality",
+      "title": "Dead import statements in legacy payout utils",
+      "owner_verdict": "known_deferred",
+      "owner_reason": "Dead imports live in files scheduled for deletion in the next refactor. Touching them now creates merge conflicts with the deletion PR. Deliberately not cleaning up until that lands.",
+      "suppressed_by": ["save_gate::why_might_be_intentional", "COMMIT_NARRATIVE::trajectories"],
+      "notes": "COMMIT_NARRATIVE should show the legacy file has zero recent commits (trajectory = 'dormant'), which is the hint that it's pending deletion, not maintained."
+    }
+  ]
+}

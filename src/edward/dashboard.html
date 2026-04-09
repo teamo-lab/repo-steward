@@ -219,6 +219,31 @@
   .ci-empty { text-align: center; padding: 32px 16px; color: var(--text-muted); }
   .ci-empty .icon { font-size: 36px; margin-bottom: 8px; opacity: 0.4; }
 
+  /* Open Questions */
+  .question-card { background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px 20px; margin-bottom: 12px; }
+  .question-card.answered { opacity: 0.85; border-left: 3px solid var(--green); }
+  .question-card .q-title { font-size: 15px; font-weight: 600; color: var(--text);
+    margin-bottom: 8px; line-height: 1.4; }
+  .question-card .q-why { font-size: 13px; color: var(--text-muted);
+    margin-bottom: 6px; }
+  .question-card .q-why strong { color: var(--text); font-weight: 500; }
+  .question-card .q-change { font-size: 13px; color: var(--text-muted);
+    margin-bottom: 12px; }
+  .question-card .q-change strong { color: var(--text); font-weight: 500; }
+  .question-card textarea { width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+    font-family: inherit; font-size: 13px; line-height: 1.5; resize: vertical;
+    min-height: 70px; margin-bottom: 10px; }
+  .question-card textarea:focus { outline: none; border-color: var(--accent); }
+  .question-card .q-actions { display: flex; gap: 8px; justify-content: flex-end; }
+  .question-card .q-answer { background: var(--bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 12px; font-size: 13px; color: var(--text);
+    white-space: pre-wrap; }
+  .question-card .q-answer-label { font-size: 11px; color: var(--text-muted);
+    text-transform: uppercase; margin-bottom: 4px; letter-spacing: 0.3px; }
+  .question-card .q-meta { font-size: 11px; color: var(--text-muted); margin-top: 8px; }
+
   /* Responsive */
   @media (max-width: 768px) {
     .stats { grid-template-columns: repeat(2, 1fr); }
@@ -298,6 +323,17 @@
       <span class="count" id="suggestion-count">0</span>
     </div>
     <div id="suggestions-list"></div>
+  </div>
+
+  <!-- Open Questions: calibrated-abstention escape hatch from the scanner.
+       data-tab + id are acceptance markers so TEST_SPEC grep checks lock
+       the Questions surface in place across future refactors. -->
+  <div class="section" id="questions-tab" data-tab="questions">
+    <div class="section-header">
+      <h2>Open Questions</h2>
+      <span class="count" id="question-count">0</span>
+    </div>
+    <div id="questions-list"></div>
   </div>
 
   <!-- All Tasks -->
@@ -438,7 +474,7 @@ async function loadRepos() {
 async function loadRepo() {
   currentRepo = document.getElementById('repo-select').value;
   if (!currentRepo) return;
-  await Promise.all([loadStats(), loadCIScorecard(), loadSuggestions(), loadTasks(), loadExecutions()]);
+  await Promise.all([loadStats(), loadCIScorecard(), loadSuggestions(), loadQuestions(), loadTasks(), loadExecutions()]);
   // If a discovery is already running on the server (e.g. user reloaded the page
   // mid-analysis or switched repos), surface the banner and resume polling so the
   // dashboard auto-refreshes when it finishes.
@@ -560,6 +596,73 @@ async function loadSuggestions() {
   }
 
   el.innerHTML = data.suggestions.map(s => renderTask(s.task, true)).join('');
+}
+
+// ── Open Questions ──
+//
+// Calibrated abstention escape hatch: when the scanner isn't sure about a
+// finding, it emits an open_question instead of guessing. Owner answers here;
+// the answer is persisted to per-repo memory and consumed on the next scan.
+async function loadQuestions() {
+  if (!currentRepo) return;
+  let data;
+  try {
+    data = await api('/api/v1/repos/' + currentRepo + '/questions');
+  } catch {
+    data = { open: [], answered: [], open_count: 0, answered_count: 0 };
+  }
+  const el = document.getElementById('questions-list');
+  const total = (data.open_count || 0) + (data.answered_count || 0);
+  document.getElementById('question-count').textContent = data.open_count || 0;
+
+  if (total === 0) {
+    el.innerHTML = '<div class="empty"><div class="icon">&#63;</div>No questions from the last scan</div>';
+    return;
+  }
+
+  const openHtml = (data.open || []).map(q => `
+    <div class="question-card" data-qid="${esc(q.id)}">
+      <div class="q-title">${esc(q.question)}</div>
+      ${q.why_it_matters ? `<div class="q-why"><strong>Why it matters:</strong> ${esc(q.why_it_matters)}</div>` : ''}
+      ${q.what_would_change ? `<div class="q-change"><strong>What would change:</strong> ${esc(q.what_would_change)}</div>` : ''}
+      <textarea id="q-answer-${esc(q.id)}" rows="3" placeholder="Your answer — one sentence is fine."></textarea>
+      <div class="q-actions">
+        <button class="btn btn-approve" onclick="answerQuestion('${esc(q.id)}')">Save answer</button>
+      </div>
+      <div class="q-meta">Asked ${new Date(q.asked_at).toLocaleString()}</div>
+    </div>
+  `).join('');
+
+  const answeredHtml = (data.answered || []).map(q => `
+    <div class="question-card answered">
+      <div class="q-title">${esc(q.question)}</div>
+      <div class="q-answer-label">Answer</div>
+      <div class="q-answer">${esc(q.answer || '')}</div>
+      <div class="q-meta">Answered ${q.answered_at ? new Date(q.answered_at).toLocaleString() : ''}</div>
+    </div>
+  `).join('');
+
+  el.innerHTML = openHtml +
+    (answeredHtml ? `<div style="font-size:12px;color:var(--text-muted);text-transform:uppercase;margin:18px 0 8px;letter-spacing:0.3px;">Previously answered</div>${answeredHtml}` : '');
+}
+
+async function answerQuestion(questionId) {
+  if (!currentRepo) return;
+  const ta = document.getElementById('q-answer-' + questionId);
+  if (!ta) return;
+  const answer = (ta.value || '').trim();
+  if (!answer) { toast('Please write an answer first'); return; }
+  try {
+    await api('/api/v1/repos/' + currentRepo + '/questions/' + questionId + '/answer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answer }),
+    });
+    toast('Answer saved');
+    loadQuestions();
+  } catch (err) {
+    toast('Failed to save answer: ' + (err && err.message ? err.message : 'unknown'));
+  }
 }
 
 // ── Tasks ──
@@ -831,6 +934,7 @@ function pollDiscovery() {
         toast('Discovery complete! Refreshing...');
         loadStats();
         loadSuggestions();
+        loadQuestions();
         loadTasks();
       }
     } catch { clearInterval(activePoll); activePoll = null; setDiscoveryRunning(false); }

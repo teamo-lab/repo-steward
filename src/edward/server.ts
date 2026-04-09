@@ -12,6 +12,9 @@ import { spawn, spawnSync, execSync } from 'node:child_process';
 import { detectRepoProfile, type RepoProfile } from './profile.js';
 import { extractCIRawConfig, type CIRawConfig } from './ci_extract.js';
 import { detectHotModules, type HotModule } from './hot_modules.js';
+import {
+  loadRepoMemory, recordDismissal, recordAnswer, fingerprintFor,
+} from './repo_memory.js';
 import { invokeLLMWithFallback, isProvider, type Provider } from './llm_provider.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -70,10 +73,30 @@ interface EdwardExecution {
   created_at: string;
 }
 
+// Async Q&A: the LLM can emit open_questions[] from a scan instead of
+// forcing a guess on a low-confidence finding. Each question is stashed
+// server-side and exposed via GET /api/v1/repos/:id/questions so the
+// repo owner can answer it in their own time from the dashboard. When
+// answered, the answer is written back to per-repo memory and picked up
+// on the next scan via REPO_MEMORY.answeredQuestions.
+interface EdwardQuestion {
+  id: string;
+  repo_id: string;
+  scan_id: string;
+  question: string;
+  why_it_matters: string;
+  what_would_change: string;
+  status: 'open' | 'answered';
+  answer: string | null;
+  asked_at: string;
+  answered_at: string | null;
+}
+
 // State
 const repos: Map<string, EdwardRepo> = new Map();
 const tasks: Map<string, EdwardTask> = new Map();
 const executions: Map<string, EdwardExecution> = new Map();
+const questions: Map<string, EdwardQuestion> = new Map();
 let discoveryRunning = false;
 
 function uuid(): string {
@@ -557,6 +580,14 @@ RULES
 - BE HONEST: if the codebase is healthy and you genuinely cannot find
   any high-confidence issue in a category, return zero items for that
   category. Do not invent or pad.
+- ASK INSTEAD OF GUESS: if a candidate finding depends on business
+  context you CANNOT verify from code alone (e.g. "is it allowed to
+  expose the Alipay user ID in this UI?", "is the 300s timeout on
+  this endpoint intentional?"), emit an open_question instead of
+  fabricating a finding. Cap: AT MOST 3 open_questions per scan.
+  Each must be answerable in one sentence by the repo owner. The
+  owner answers async via the dashboard Questions tab and the next
+  scan skips questions that have already been answered.
 - BE EXHAUSTIVE: there is NO upper limit on findings per category.
   Report every issue you find with confidence ≥ 0.7. If a real
   codebase has 25 high-confidence functional bugs, return 25. Do not
@@ -574,8 +605,9 @@ Return EXACTLY one JSON object with this top-level shape:
 
 {
   "ci_scorecard": { ...CIScorecard schema below... },
-  "ci_findings":          [ ...task objects from Phase 0... ],
-  "phase_1_2_3_findings": [ ...task objects from Phases 1-3... ]
+  "ci_findings":          [ ...task objects from Phase 0...    ],
+  "phase_1_2_3_findings": [ ...task objects from Phases 1-3... ],
+  "open_questions":       [ ...open_question objects, MAX 3... ]
 }
 
 Each task object (in either array) follows this schema:
@@ -601,6 +633,16 @@ Each task object (in either array) follows this schema:
     "steps": ["step 1", "step 2"],
     "successCriteria": ["After fix, X should produce Y instead of Z"]
   }
+}
+
+
+Each open_question object follows this schema:
+
+{
+  "question": "One sentence the owner can answer in one sentence. e.g. 'Is the Alipay user ID allowed to be shown to end users in the payout UI?'",
+  "context":  "One sentence of why this matters to your analysis. e.g. 'I have a candidate finding that treats this as PII exposure, but if it is intentional per compliance, the finding should be dropped.'",
+  "blocks_finding_type": "security_fix",    // optional — which finding type this would unblock if answered
+  "would_emit_without_answer": false          // true if you would rather emit the finding anyway than ask
 }
 
 Allowed type tokens:
@@ -841,6 +883,12 @@ function toEdwardTask(t: any): EdwardTask | null {
 interface AnalyzeResult {
   tasks: EdwardTask[];
   scorecard: CIScorecard | null;
+  open_questions: Array<{
+    question: string;
+    why_it_matters: string;
+    what_would_change: string;
+  }>;
+  scan_id: string;
 }
 
 async function analyzeRepoWithAgent(
@@ -864,7 +912,7 @@ async function analyzeRepoWithAgent(
       console.log(`[edward] cloned branch: ${opts.branch}`);
     }
 
-    // Layer 1 + 2 + 3: profile, CI extraction, and hot-module detection
+    // Layer 1 + 2 + 3: profile, CI extraction, hot-module detection.
     const profile = detectRepoProfile(`${tmpDir}/repo`);
     const ciRaw = extractCIRawConfig(`${tmpDir}/repo`);
     const hotModules = detectHotModules(`${tmpDir}/repo`, { topN: 8 });
@@ -946,7 +994,7 @@ async function analyzeRepoWithAgent(
     const phaseResults = await Promise.all(phases);
 
     let totalCost = 0;
-    let combinedParsed: ParsedAnalysis = { ci_findings: [], phase_1_2_3_findings: [], scorecard: null };
+    let combinedParsed: ParsedAnalysis = { ci_findings: [], phase_1_2_3_findings: [], scorecard: null, open_questions: [] };
     for (const pr of phaseResults) {
       totalCost += pr.costUsd;
       const triedLabel =
@@ -975,10 +1023,13 @@ async function analyzeRepoWithAgent(
       if (phaseParsed.scorecard && !combinedParsed.scorecard) {
         combinedParsed.scorecard = phaseParsed.scorecard;
       }
+      if (phaseParsed.open_questions.length > 0) {
+        combinedParsed.open_questions.push(...phaseParsed.open_questions);
+      }
     }
 
     if (phaseResults.every(p => !p.ok)) {
-      return { tasks: [], scorecard: null };
+      return { tasks: [], scorecard: null, open_questions: [], scan_id: uuid() };
     }
 
     const parsed = combinedParsed;
@@ -994,7 +1045,36 @@ async function analyzeRepoWithAgent(
     }
 
     const allRaw = [...parsed.ci_findings, ...parsed.phase_1_2_3_findings];
-    const tasks = allRaw.map(toEdwardTask).filter((t): t is EdwardTask => t !== null);
+    const unfilteredTasks = allRaw.map(toEdwardTask).filter((t): t is EdwardTask => t !== null);
+
+    // Server-layer dismissed-finding filter. The prompt is no longer
+    // aware of REPO_MEMORY, so we enforce "once the owner dismissed
+    // this finding, do not raise it again" here in code. We load the
+    // per-repo memory and drop any task whose fingerprint matches a
+    // previous dismissal. recordDismissal is still called from the
+    // dismiss action handler so new dismissals keep feeding this list.
+    let dismissedSkipped = 0;
+    let tasks: EdwardTask[] = unfilteredTasks;
+    try {
+      const mem = loadRepoMemory(fullName);
+      if (mem.dismissedFindings.length > 0) {
+        const dismissedFps = new Set(mem.dismissedFindings.map(d => d.fingerprint));
+        tasks = unfilteredTasks.filter(t => {
+          const fp = fingerprintFor(t.type || 'unknown', t.title || '');
+          if (dismissedFps.has(fp)) {
+            dismissedSkipped++;
+            return false;
+          }
+          return true;
+        });
+      }
+    } catch (err: any) {
+      console.warn(`[edward] dismissed-finding filter failed for ${fullName}: ${err?.message || err}`);
+      tasks = unfilteredTasks;
+    }
+    if (dismissedSkipped > 0) {
+      console.log(`[edward] repo_memory: skipped ${dismissedSkipped} previously-dismissed finding(s) for ${fullName}`);
+    }
 
     // CR #1 + #3 fix: deterministic "no CI at all" guarantee.
     //
@@ -1074,12 +1154,29 @@ async function analyzeRepoWithAgent(
       }
     }
 
-    console.log(`[edward] Parsed ${tasks.length} tasks (${parsed.ci_findings.length} CI + ${parsed.phase_1_2_3_findings.length} product), scorecard=${parsed.scorecard ? 'yes' : 'no'}`);
+    // Normalize open_questions: drop anything malformed, cap at 3,
+    // slice strings to sane lengths. This runs in-process so we can
+    // trust the shape when wiring downstream state.
+    const rawOpenQuestions = Array.isArray(parsed.open_questions) ? parsed.open_questions : [];
+    const normalizedOpenQuestions = rawOpenQuestions
+      .filter(q => q && typeof q === 'object' && typeof q.question === 'string' && q.question.trim())
+      .slice(0, 3)
+      .map(q => ({
+        question: String(q.question).slice(0, 500),
+        why_it_matters: String(q.why_it_matters || '').slice(0, 500),
+        what_would_change: String(q.what_would_change || '').slice(0, 500),
+      }));
 
-    return { tasks, scorecard: parsed.scorecard };
+    const scanId = uuid();
+    console.log(
+      `[edward] Parsed ${tasks.length} tasks (${parsed.ci_findings.length} CI + ${parsed.phase_1_2_3_findings.length} product), ` +
+      `scorecard=${parsed.scorecard ? 'yes' : 'no'}, open_questions=${normalizedOpenQuestions.length}`
+    );
+
+    return { tasks, scorecard: parsed.scorecard, open_questions: normalizedOpenQuestions, scan_id: scanId };
   } catch (err: any) {
     console.error(`[edward] Agent analysis failed: ${err.message}`);
-    return { tasks: [], scorecard: null };
+    return { tasks: [], scorecard: null, open_questions: [], scan_id: uuid() };
   } finally {
     try { execSync(`rm -rf ${tmpDir}`, { stdio: 'pipe' }); } catch {}
   }
@@ -1247,6 +1344,7 @@ interface ParsedAnalysis {
   ci_findings: any[];
   phase_1_2_3_findings: any[];
   scorecard: CIScorecard | null;
+  open_questions: any[];
 }
 
 /**
@@ -1293,7 +1391,7 @@ function stripTrailingProseAndParse(text: string): any | null {
 }
 
 function parseAnalysisResult(text: string): ParsedAnalysis {
-  const empty: ParsedAnalysis = { ci_findings: [], phase_1_2_3_findings: [], scorecard: null };
+  const empty: ParsedAnalysis = { ci_findings: [], phase_1_2_3_findings: [], scorecard: null, open_questions: [] };
 
   // Always dump the raw text so post-mortem doesn't require re-running
   // the (expensive) discover. Cheap: it's a few hundred KB at most, and
@@ -1306,24 +1404,26 @@ function parseAnalysisResult(text: string): ParsedAnalysis {
 
   const tryShape = (parsed: any): ParsedAnalysis | null => {
     if (!parsed) return null;
-    // New shape: object with at least one of the three expected keys
+    // New shape: object with at least one of the four expected keys
     if (typeof parsed === 'object' && !Array.isArray(parsed)) {
       const ci = Array.isArray(parsed.ci_findings) ? parsed.ci_findings : [];
       const p123 = Array.isArray(parsed.phase_1_2_3_findings) ? parsed.phase_1_2_3_findings : [];
       const scorecard: CIScorecard | null = parsed.ci_scorecard && typeof parsed.ci_scorecard === 'object'
         ? parsed.ci_scorecard
         : null;
-      // Accept the object if it has ANY of the three expected keys — even if
-      // all three are empty/null. A correct-shape-but-empty result (LLM
+      const oq = Array.isArray(parsed.open_questions) ? parsed.open_questions : [];
+      // Accept the object if it has ANY of the four expected keys — even if
+      // all four are empty/null. A correct-shape-but-empty result (LLM
       // legitimately found nothing) must not be misclassified as a parse
       // failure; that was the CR #2 bug, which combined with CR #1 burned
       // $1+ runs and showed users "0 findings" + a /tmp dump.
       const hasKnownKey =
         'ci_findings' in parsed ||
         'phase_1_2_3_findings' in parsed ||
-        'ci_scorecard' in parsed;
+        'ci_scorecard' in parsed ||
+        'open_questions' in parsed;
       if (hasKnownKey) {
-        return { ci_findings: ci, phase_1_2_3_findings: p123, scorecard };
+        return { ci_findings: ci, phase_1_2_3_findings: p123, scorecard, open_questions: oq };
       }
       // Object lacks every known key — wrong shape, give up on this attempt
       // (don't fall through to "treat as phase_1_2_3" here, a wrong-shape
@@ -1347,7 +1447,7 @@ function parseAnalysisResult(text: string): ParsedAnalysis {
         t => t && typeof t === 'object' && typeof t.title === 'string'
       );
       if (!looksLikeTasks) return null;
-      return { ci_findings: [], phase_1_2_3_findings: parsed, scorecard: null };
+      return { ci_findings: [], phase_1_2_3_findings: parsed, scorecard: null, open_questions: [] };
     }
     return null;
   };
@@ -1580,7 +1680,37 @@ async function handleRequest(req: Request): Promise<Response> {
           if (saved >= SAVE_CAP) break;
         }
 
-        console.log(`[edward] Discovery complete: ${saved} tasks saved, scorecard=${result.scorecard ? `${result.scorecard.overall_score}/100` : 'none'} for ${repo.full_name}`);
+        // Stash open_questions from this scan. Dedupe against EVERY
+        // prior question on the same repo (both status='open' and
+        // status='answered') by question text — once the owner has
+        // answered a question, we never re-ask it, even though the
+        // prompt no longer reads REPO_MEMORY.answeredQuestions.
+        let newQuestions = 0;
+        for (const oq of result.open_questions) {
+          const dup = [...questions.values()].find(
+            q => q.repo_id === repo.id && q.question === oq.question
+          );
+          if (dup) continue;
+          const q: EdwardQuestion = {
+            id: uuid(),
+            repo_id: repo.id,
+            scan_id: result.scan_id,
+            question: oq.question,
+            why_it_matters: oq.why_it_matters,
+            what_would_change: oq.what_would_change,
+            status: 'open',
+            answer: null,
+            asked_at: new Date().toISOString(),
+            answered_at: null,
+          };
+          questions.set(q.id, q);
+          newQuestions++;
+        }
+
+        console.log(
+          `[edward] Discovery complete: ${saved} tasks saved, scorecard=${result.scorecard ? `${result.scorecard.overall_score}/100` : 'none'}, ` +
+          `${newQuestions} new open_questions, for ${repo.full_name}`
+        );
       } catch (err: any) {
         console.error(`[edward] Discovery failed: ${err.message}`);
       } finally {
@@ -1598,6 +1728,53 @@ async function handleRequest(req: Request): Promise<Response> {
       .filter(t => t.repo_id === tasksMatch[1])
       .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
     return json({ tasks: repoTasks, count: repoTasks.length });
+  }
+
+  // Open questions for a repo (async Q&A inbox from calibrated abstention)
+  const questionsListMatch = path.match(/^\/api\/v1\/repos\/([^/]+)\/questions$/);
+  if (questionsListMatch && method === 'GET') {
+    const repo = repos.get(questionsListMatch[1]);
+    if (!repo) return json({ error: 'Repo not found' }, 404);
+    const repoQs = [...questions.values()].filter(q => q.repo_id === repo.id);
+    const open = repoQs
+      .filter(q => q.status === 'open')
+      .sort((a, b) => new Date(b.asked_at).getTime() - new Date(a.asked_at).getTime());
+    const answered = repoQs
+      .filter(q => q.status === 'answered')
+      .sort((a, b) => new Date(b.answered_at || b.asked_at).getTime() - new Date(a.answered_at || a.asked_at).getTime());
+    return json({ open, answered, open_count: open.length, answered_count: answered.length });
+  }
+
+  // Answer a question: writes to in-memory Map + persists to repo memory
+  const answerMatch = path.match(/^\/api\/v1\/repos\/([^/]+)\/questions\/([^/]+)\/answer$/);
+  if (answerMatch && method === 'POST') {
+    const repo = repos.get(answerMatch[1]);
+    if (!repo) return json({ error: 'Repo not found' }, 404);
+    const q = questions.get(answerMatch[2]);
+    if (!q || q.repo_id !== repo.id) return json({ error: 'Question not found' }, 404);
+    let body: { answer?: string };
+    try {
+      body = await req.json() as { answer?: string };
+    } catch {
+      return json({ error: 'Invalid JSON body' }, 400);
+    }
+    const answer = (body.answer || '').trim();
+    if (!answer) return json({ error: 'answer must be a non-empty string' }, 400);
+    if (answer.length > 2000) return json({ error: 'answer too long (max 2000 chars)' }, 400);
+
+    q.status = 'answered';
+    q.answer = answer;
+    q.answered_at = new Date().toISOString();
+
+    // Persist to per-repo memory so the next scan picks this up via
+    // REPO_MEMORY.answeredQuestions. Best-effort; the in-memory update
+    // above is authoritative for the current session.
+    try {
+      recordAnswer(repo.full_name, q.id, q.question, answer, q.scan_id);
+    } catch (err: any) {
+      console.warn(`[edward] recordAnswer failed for ${repo.full_name}: ${err?.message || err}`);
+    }
+    return json({ status: 'answered', question: q });
   }
 
   // Task action
@@ -1621,10 +1798,27 @@ async function handleRequest(req: Request): Promise<Response> {
         task.execution_id = exec.id;
         return json({ status: 'approved', execution: exec });
       }
-      case 'dismiss':
+      case 'dismiss': {
         task.status = 'dismissed';
         task.dismiss_reason = body.reason || 'Dismissed from dashboard';
+        // Persist to per-repo memory so analyzeRepoWithAgent's
+        // server-layer filter can drop this finding's fingerprint on
+        // the next scan. Best-effort: repo may not be in the map
+        // anymore (e.g. manual deletion), in which case we just skip.
+        const dismissRepo = repos.get(task.repo_id);
+        if (dismissRepo) {
+          try {
+            recordDismissal(
+              dismissRepo.full_name,
+              { type: task.type, title: task.title, id: task.id },
+              task.dismiss_reason,
+            );
+          } catch (err: any) {
+            console.warn(`[edward] recordDismissal failed for ${dismissRepo.full_name}: ${err?.message || err}`);
+          }
+        }
         return json({ status: 'dismissed' });
+      }
       case 'snooze':
         task.status = 'snoozed';
         task.snooze_until = body.snoozeUntil || new Date(Date.now() + 86400000).toISOString();
@@ -1680,4 +1874,4 @@ export function startEdwardServer(port = 8080): void {
   loadSeedFile().catch((err) => console.error(`[edward] seed: load crashed: ${err?.message || err}`));
 }
 
-export { repos, tasks, executions };
+export { repos, tasks, executions, questions };
