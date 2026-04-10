@@ -108,6 +108,10 @@ interface ParsedArgs {
   skipFunctionalCI?: boolean;
   /** --auth <claude-oauth|claude-api|codex>: explicit non-interactive auth selection for `edward serve`. */
   auth?: string;
+  /** --dry-run: for `edward review`, skip posting the comment to the PR. */
+  dryRun?: boolean;
+  /** --repo owner/name: for `edward review <number>` form. */
+  repo?: string;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -133,6 +137,9 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (a === '--skip-functional-ci') { out.skipFunctionalCI = true; }
     else if (a === '--auth') { out.auth = argv[++i]; }
     else if (a.startsWith('--auth=')) { out.auth = a.slice(7); }
+    else if (a === '--dry-run') { out.dryRun = true; }
+    else if (a === '--repo') { out.repo = argv[++i]; }
+    else if (a.startsWith('--repo=')) { out.repo = a.slice(7); }
     else if (a.startsWith('--url=')) { out.url = a.slice(6); }
     else if (a.startsWith('--reason=')) { out.reason = a.slice(9); }
     else if (a.startsWith('--until=')) { out.until = a.slice(8); }
@@ -1225,6 +1232,169 @@ async function cmdExecutions(args: ParsedArgs): Promise<void> {
   });
 }
 
+// ── PR review command (Sprint 1 MVP) ──
+//
+// Unlike other commands, `edward review` does NOT talk to the Edward
+// server — it runs entirely client-side using `gh` CLI for diff access
+// and the same LLM provider subprocess pattern as functional_ci. The
+// cached business context (~/.edward/contexts/<slug>.yml) is the only
+// state shared with the repo-level scanner.
+
+async function cmdReview(args: ParsedArgs): Promise<void> {
+  const prArg = args._[1];
+  if (!prArg) {
+    throw new Error(
+      'edward review requires a PR URL or number.\n' +
+      '  edward review https://github.com/owner/repo/pull/123\n' +
+      '  edward review 123 --repo owner/repo'
+    );
+  }
+
+  const { loadPRDiff, parsePRReference } = await import('./pr_diff.js');
+  const { runPRReview, loadCachedContextForPRReview } = await import('./pr_review.js');
+  const { postReviewComment, renderCommentBody } = await import('./pr_comment.js');
+  const { runCodeReview, isCodeReviewAvailable } = await import('./pr_code_review.js');
+
+  const ref = parsePRReference(prArg, args.repo);
+  if (!ref) {
+    throw new Error(
+      `Could not parse "${prArg}" as a PR reference.\n` +
+      `  Accepted: https://github.com/<owner>/<repo>/pull/<n>  or  <n> --repo <owner>/<repo>`
+    );
+  }
+
+  // Load cached business context BEFORE we pull the diff so we can
+  // bail early with a clear message if the user never ran discover.
+  const ctx = await loadCachedContextForPRReview(ref.owner, ref.repo);
+  if (!ctx) {
+    const slugHint = `${ref.owner}/${ref.repo}`;
+    if (process.stdin.isTTY) {
+      console.log(
+        `${c.yellow}Edward has no cached business context for ${c.bold}${slugHint}${c.reset}${c.yellow}.${c.reset}\n` +
+        `PR review mode reads the same context that ${c.bold}edward discover${c.reset} produces.\n\n` +
+        `Run ${c.bold}edward discover ${slugHint}${c.reset} first (3-5 minutes, one-time), then rerun this command.`
+      );
+    } else {
+      console.error(
+        `error: no cached business context for ${slugHint}. ` +
+        `Run 'edward discover ${slugHint}' first.`
+      );
+    }
+    process.exit(2);
+  }
+
+  console.error(`${c.dim}[edward] Loading PR #${ref.number} diff via gh CLI...${c.reset}`);
+  const diff = await loadPRDiff(prArg, { repoHint: args.repo });
+  console.error(
+    `${c.dim}[edward] Loaded ${diff.files.length} file(s), ${diff.total_changed_lines} changed line(s)` +
+    (diff.too_large ? ` ${c.yellow}(too large — will skip LLM analysis)${c.reset}` : c.reset)
+  );
+
+  const totalInvariants = ctx.critical_flows.reduce((n, f) => n + f.invariants.length, 0);
+  console.error(
+    `${c.dim}[edward] Running invariant-aware review ` +
+    `(${ctx.critical_flows.length} flows, ${totalInvariants} invariants)...${c.reset}`
+  );
+
+  const codeReviewAvailable = isCodeReviewAvailable();
+  if (codeReviewAvailable && !args.dryRun) {
+    console.error(`${c.dim}[edward] Running Qodo Merge code review in parallel...${c.reset}`);
+  }
+
+  // Run Edward invariant review + Qodo Merge code review in parallel.
+  const [result, codeReviewResult] = await Promise.all([
+    runPRReview(diff, ctx),
+    (codeReviewAvailable && !args.dryRun)
+      ? runCodeReview(prArg)
+      : Promise.resolve(null),
+  ]);
+
+  if (args.json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  // Human-readable terminal summary.
+  const b = c.bold, r = c.reset, d = c.dim;
+  console.log('');
+  console.log(`${b}Edward — Business Invariant Review${r}`);
+  console.log(`${d}${result.pr.owner}/${result.pr.repo}#${result.pr.number} — ${result.pr.title}${r}`);
+  console.log('');
+
+  if (result.too_large) {
+    console.log(`${c.yellow}⏭ Skipped: ${result.skipped_reason}${r}`);
+  } else if (result.skipped_reason) {
+    console.log(`${c.yellow}⚠ ${result.skipped_reason}${r}`);
+  } else if (result.verdicts.length === 0) {
+    console.log(`${c.green}✓ No business invariants touched (${result.context.total_invariants} checked).${r}`);
+  } else {
+    const broken = result.verdicts.filter((v) => v.verdict === 'broken');
+    const weakened = result.verdicts.filter((v) => v.verdict === 'weakened');
+    const newGap = result.verdicts.filter((v) => v.verdict === 'new_gap');
+    const unchanged = result.verdicts.filter((v) => v.verdict === 'unchanged');
+
+    const label = (v: string): string =>
+      v === 'broken' ? `${c.red}✗ BROKEN${r}`
+      : v === 'weakened' ? `${c.yellow}⚠ WEAKENED${r}`
+      : v === 'new_gap' ? `${c.yellow}🕳 NEW GAP${r}`
+      : `${c.green}✓ unchanged${r}`;
+
+    for (const v of [...broken, ...weakened, ...newGap, ...unchanged]) {
+      console.log(`${label(v.verdict)}  ${c.bold}${v.flow_id}::${v.invariant_id}${r}  ${d}(${v.severity})${r}`);
+      console.log(`  ${d}${v.invariant_description}${r}`);
+      if (v.semantic_delta && v.verdict !== 'unchanged') {
+        console.log(`  ${d}delta:${r} ${v.semantic_delta}`);
+      }
+      if (v.runtime_implication && v.verdict !== 'unchanged') {
+        console.log(`  ${d}implication:${r} ${v.runtime_implication}`);
+      }
+      if (v.reason) console.log(`  ${d}reason:${r} ${v.reason}`);
+      if (v.evidence_hunks.length > 0) {
+        console.log(`  ${d}evidence:${r} ${v.evidence_hunks.join(', ')}`);
+      }
+      console.log('');
+    }
+    console.log(
+      `${d}Summary: broken=${broken.length} weakened=${weakened.length} ` +
+      `new_gap=${newGap.length} unchanged=${unchanged.length}${r}`
+    );
+  }
+
+  const totalDur = (result.diagnostics.stage_a_duration_ms + result.diagnostics.stage_b_duration_ms) / 1000;
+  const totalCost = result.diagnostics.stage_a_cost_usd + result.diagnostics.stage_b_cost_usd;
+  console.log(`${d}Cost: $${totalCost.toFixed(3)}  Duration: ${totalDur.toFixed(1)}s${r}`);
+
+  if (codeReviewResult) {
+    if (codeReviewResult.ok) {
+      console.log(`${c.green}✓ Qodo Merge code review posted${r}`);
+    } else if (codeReviewResult.skipped) {
+      console.log(`${d}Qodo Merge: skipped — ${codeReviewResult.skip_reason}${r}`);
+    } else {
+      console.log(`${c.yellow}⚠ Qodo Merge code review failed: ${codeReviewResult.skip_reason}${r}`);
+    }
+  } else if (!codeReviewAvailable) {
+    console.log(`${d}Qodo Merge: not installed (install pr-agent to enable code-level review)${r}`);
+  }
+  console.log('');
+
+  // Post to PR unless --dry-run.
+  if (args.dryRun) {
+    console.log(`${d}--dry-run: skipping comment post. Rendered preview:${r}`);
+    console.log('---8<---');
+    console.log(renderCommentBody(result));
+    console.log('---8<---');
+  } else {
+    console.error(`${d}[edward] Posting review comment...${r}`);
+    const url = await postReviewComment(result);
+    if (url) {
+      console.log(`${c.green}✓ Posted:${r} ${url}`);
+    } else {
+      console.log(`${c.yellow}⚠ Comment post failed — see stderr for details.${r}`);
+      process.exit(1);
+    }
+  }
+}
+
 function cmdHelp(): void {
   const b = c.bold, d = c.dim, r = c.reset;
   console.log(`${b}edward${r} — proactive agent for repo maintenance  ${d}(Repo Steward v0.4)${r}
@@ -1241,6 +1411,8 @@ ${b}COMMANDS${r}
 
   ${b}discover${r} <repo> [--wait] [--provider]   Trigger agent analysis (async unless --wait)
   ${b}ci-audit${r} <repo> [--wait] [--provider]   CI completeness audit only (faster, no product bug scan)
+  ${b}review${r} <pr-url-or-number> [--repo owner/repo] [--dry-run] [--json]
+                                   Review a GitHub PR against the repo's cached business invariants
   ${b}suggestions${r} <repo>               Top 10 open suggestions for a repo
   ${b}tasks${r} <repo>                     All tasks (any status)
   ${b}stats${r} <repo>                     Acceptance rate, merge rate, counts
@@ -1266,6 +1438,8 @@ ${b}FLAGS${r}
   --refresh-context                Ignore cached context and regenerate via LLM auto-extract
   --skip-functional-ci             Run discover without the functional CI gap analysis phase
   --no-interactive                 Don't prompt for context confirmation (auto-accept / auto-skip)
+  --dry-run                        For 'review': print result but don't post comment to the PR
+  --repo owner/name                For 'review': pair with a bare PR number
   --reason "..."                   Reason for dismiss
   --until ISO                      ISO timestamp for snooze
 
@@ -1279,6 +1453,8 @@ ${b}EXAMPLES${r}
   edward discover floatmiracle/ama-user-service --branch shufanci --wait
   edward discover my/repo --context-file ~/ctx.yml --wait
   edward discover my/repo --refresh-context --wait   # force regenerate business context
+  edward review https://github.com/floatmiracle/ama-user-service/pull/10 --dry-run
+  edward review 10 --repo floatmiracle/ama-user-service --dry-run --json
   edward suggestions teamo-lab/clawschool
   edward approve a1b2c3d4
   edward dismiss a1b2c3d4 --reason "won't fix"
@@ -1334,6 +1510,10 @@ export async function runCli(argv: string[]): Promise<number> {
 
       case 'discover':
         await cmdDiscover(args);
+        return 0;
+
+      case 'review':
+        await cmdReview(args);
         return 0;
 
       case 'ci-audit':
