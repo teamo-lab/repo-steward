@@ -67,6 +67,34 @@ interface EdwardTask {
   updated_at: string;
 }
 
+// Clustering: separate state for cluster parents (never stored in tasks Map)
+interface ClusterParent {
+  id: string;
+  title: string;
+  description: string;
+  member_ids: string[];
+  rationale: string;
+  confidence: number;
+  risk_level: string;
+}
+
+interface ClusterResult {
+  parents: ClusterParent[];
+  isolate_ids: string[];
+  clustering_failed: boolean;
+  created_at: string;
+}
+
+interface RawClusterOutput {
+  clusters: Array<{
+    title: string;
+    description: string;
+    member_ids: string[];
+    rationale: string;
+  }>;
+  isolates: string[];
+}
+
 interface EdwardExecution {
   id: string;
   task_id: string;
@@ -105,6 +133,7 @@ const repos: Map<string, EdwardRepo> = new Map();
 const tasks: Map<string, EdwardTask> = new Map();
 const executions: Map<string, EdwardExecution> = new Map();
 const questions: Map<string, EdwardQuestion> = new Map();
+const clusterResults: Map<string, ClusterResult> = new Map();
 let discoveryRunning = false;
 
 function uuid(): string {
@@ -745,6 +774,82 @@ exploration time is limited, but do not skip categories entirely.
 
 REMINDER: respond with the JSON object only. No prose, no markdown, no code fence.`;
 
+const CLUSTER_PROMPT_INSTRUCTIONS = `You are a senior product engineer. You will receive a list of findings from a repository scan. Your job is to cluster related findings into parent groups so the repo owner sees ~8–14 top-level items instead of 20–30.
+
+══════════════════════════════════════
+HARD RULES (validated server-side — violations cause your output to be rejected)
+══════════════════════════════════════
+
+1. Do NOT invent IDs. Every member_ids entry must be a verbatim id from the input.
+2. Do NOT drop findings. The union of all member_ids + isolates must equal the input id set exactly.
+3. Do NOT rewrite child content. You write parent title and description only.
+4. At most 8 clusters. Prefer isolates over forced clusters.
+5. Minimum cluster size: 2. Size-1 clusters are isolates.
+6. Output language: match the input language. Chinese findings → Chinese parents. English → English. Mixed → your call.
+
+══════════════════════════════════════
+PARENT TITLE STYLE
+══════════════════════════════════════
+
+Write titles from the user's or attacker's perspective, impact-first.
+
+GOOD examples:
+- 一个人可以直接上线任意代码
+- 攻击者可定向毒害其他用户的龙虾检测结果
+- 付费墙可被绕过：ack-installed → retest → score overwrite
+
+BAD examples (DO NOT write like this):
+- Multiple CI configuration issues
+- Security vulnerabilities in share-image flow
+- Missing input validation on lobsterName
+
+Rules: impact-first, user-or-attacker perspective, plain language (PM-readable), NO engineering jargon, NO file paths, NO line numbers.
+
+══════════════════════════════════════
+PARENT DESCRIPTION STYLE
+══════════════════════════════════════
+
+2-4 sentences narrating the problem AS A WHOLE. Must NOT be a bulleted list of sub-problems.
+
+══════════════════════════════════════
+GROUPING HEURISTICS (use these to decide what to cluster)
+══════════════════════════════════════
+
+A) Same root cause, multiple categories — e.g., no-CI pipeline surfaced as "no CI" + "pytest never runs" + "no lint"
+B) Same vulnerability, multiple surfaces — e.g., share-image XSS described in 3 places
+C) Attack chain (strongest reason to cluster) — individually small findings that compose into an end-to-end exploit
+D) Policy composition — no-CI + no-branch-protection + deploy_prod.sh-pulls-main → "one person can ship arbitrary code"
+E) Semantic composition — composed behavior enables targeted attack (burst-cheat + lobsterName length)
+
+══════════════════════════════════════
+ANTI-HEURISTICS (DO NOT cluster by these)
+══════════════════════════════════════
+
+- Same file
+- Same badge color / risk level
+- Both are "security"
+- Both mention "auth"
+
+══════════════════════════════════════
+OUTPUT FORMAT (strict JSON, single object, no prose before or after)
+══════════════════════════════════════
+
+{
+  "clusters": [
+    {
+      "title": "<impact-first sentence>",
+      "description": "<2-4 sentence narrative>",
+      "member_ids": ["<id>", "<id>"],
+      "rationale": "<which heuristic A-E and why, one sentence>"
+    }
+  ],
+  "isolates": ["<id>", "..."]
+}
+
+The rationale field is logged only (never shown in UI) but you MUST fill it to justify each grouping.
+
+REMINDER: respond with the JSON object only. No prose, no markdown, no code fence.`;
+
 /**
  * Build the per-run prompt by appending machine-detected facts to the
  * static instructions. Keeping the static instructions reviewable by
@@ -795,6 +900,95 @@ ${hotModulesBlock}
 CI_COVERAGE_ANALYSIS (ground truth — deterministic line-level CI reachability):
 ${JSON.stringify(coverageForPrompt(ciRaw.coverage), null, 2)}
 `;
+}
+
+function maxRisk(levels: string[]): string {
+  const order: Record<string, number> = { low: 0, medium: 1, high: 2 };
+  return levels.reduce((max, l) => (order[l] ?? 0) > (order[max] ?? 0) ? l : max, 'low');
+}
+
+function buildClusterPrompt(children: EdwardTask[], fullName: string): string {
+  const compact = children.map(t => ({
+    id: t.id,
+    type: t.type,
+    title: t.title,
+    description: (t.description || '').slice(0, 400),
+    signals: ((t.evidence as any)?.signals || []).slice(0, 3),
+    confidence: t.confidence,
+    risk_level: t.risk_level,
+  }));
+  return `${CLUSTER_PROMPT_INSTRUCTIONS}
+
+═══════════════════════════════════════
+INPUT — ${children.length} findings from ${fullName}
+═══════════════════════════════════════
+
+${JSON.stringify(compact, null, 2)}`;
+}
+
+async function clusterFindings(
+  children: EdwardTask[],
+  fullName: string,
+  cwd: string,
+  opts: { provider?: Provider; allowFallback?: boolean },
+): Promise<RawClusterOutput | null> {
+  if (children.length < 3) return null;
+
+  if (process.env.EDWARD_CLUSTER_FAIL_INJECT === '1') throw new Error('injected');
+
+  const prompt = buildClusterPrompt(children, fullName);
+  const effectiveProvider = opts.provider || 'claude';
+  const result = await invokeLLMWithFallback(prompt, cwd, {
+    provider: effectiveProvider,
+    maxTurns: 1,
+    maxBudgetUsd: 0.20,
+    timeoutMs: 120_000,
+  }, { allowFallback: opts.allowFallback ?? true });
+
+  if (!result.ok) throw new Error(`LLM call failed: ${result.error || 'unknown'}`);
+  const text = result.stdout;
+
+  // Dump raw response for debugging
+  try {
+    writeFileSync(`/tmp/edward-raw-cluster-${Date.now()}.txt`, text, 'utf-8');
+  } catch {}
+
+  const jsonStr = findFirstBalancedJson(text, '{');
+  if (!jsonStr) throw new Error('No JSON object found in cluster response');
+  const parsed = JSON.parse(jsonStr);
+
+  // Strict validation
+  if (!Array.isArray(parsed.clusters)) throw new Error('clusters must be an array');
+  if (!Array.isArray(parsed.isolates)) throw new Error('isolates must be an array');
+
+  const inputIds = new Set(children.map(c => c.id));
+  const seen = new Set<string>();
+
+  if (parsed.clusters.length > 8) throw new Error(`Too many clusters: ${parsed.clusters.length} (max 8)`);
+
+  for (const c of parsed.clusters) {
+    if (!c.title || typeof c.title !== 'string') throw new Error('Cluster missing title');
+    if (!c.description || typeof c.description !== 'string') throw new Error('Cluster missing description');
+    if (!Array.isArray(c.member_ids) || c.member_ids.length < 2) throw new Error(`Cluster "${c.title}" has < 2 members`);
+    for (const mid of c.member_ids) {
+      if (!inputIds.has(mid)) throw new Error(`Unknown member_id: ${mid}`);
+      if (seen.has(mid)) throw new Error(`Duplicate id: ${mid}`);
+      seen.add(mid);
+    }
+  }
+
+  for (const iso of parsed.isolates) {
+    if (!inputIds.has(iso)) throw new Error(`Unknown isolate id: ${iso}`);
+    if (seen.has(iso)) throw new Error(`Duplicate id: ${iso}`);
+    seen.add(iso);
+  }
+
+  if (seen.size !== inputIds.size) {
+    const missing = [...inputIds].filter(id => !seen.has(id));
+    throw new Error(`Missing ids: ${missing.join(', ')}`);
+  }
+
+  return parsed as RawClusterOutput;
 }
 
 /**
@@ -1002,6 +1196,8 @@ interface AnalyzeResult {
     what_would_change: string;
   }>;
   scan_id: string;
+  raw_cluster: RawClusterOutput | null;
+  clustering_failed: boolean;
 }
 
 async function analyzeRepoWithAgent(
@@ -1390,10 +1586,26 @@ async function analyzeRepoWithAgent(
       `scorecard=${parsed.scorecard ? 'yes' : 'no'}, open_questions=${normalizedOpenQuestions.length}`
     );
 
-    return { tasks: allTasks, scorecard: parsed.scorecard, open_questions: normalizedOpenQuestions, scan_id: scanId };
+    // Clustering pass (raw, pre-save IDs)
+    let rawCluster: RawClusterOutput | null = null;
+    let clusteringFailed = false;
+    if (process.env.EDWARD_DISABLE_CLUSTERING !== '1' && allTasks.length >= 3) {
+      try {
+        rawCluster = await clusterFindings(allTasks, fullName, tmpDir, {
+          provider: effectiveProvider,
+          allowFallback,
+        });
+      } catch (err: any) {
+        console.warn(`[edward] clustering failed, returning flat list: ${err?.message || err}`);
+        rawCluster = null;
+        clusteringFailed = true;
+      }
+    }
+
+    return { tasks: allTasks, scorecard: parsed.scorecard, open_questions: normalizedOpenQuestions, scan_id: scanId, raw_cluster: rawCluster, clustering_failed: clusteringFailed };
   } catch (err: any) {
     console.error(`[edward] Agent analysis failed: ${err.message}`);
-    return { tasks: [], scorecard: null, open_questions: [], scan_id: uuid() };
+    return { tasks: [], scorecard: null, open_questions: [], scan_id: uuid(), raw_cluster: null, clustering_failed: false };
   } finally {
     try { execSync(`rm -rf ${tmpDir}`, { stdio: 'pipe' }); } catch {}
   }
@@ -1515,6 +1727,59 @@ your own words so I know you got it, then give me your honest read:
 - Is my concern well-founded given the evidence Edward collected?
 - What additional evidence, if any, would change your mind in either direction?
 - Is Edward's risk level proportional to the actual impact, or does my concern suggest it's miscalibrated?
+
+Be direct. If you think I'm wrong, say so and tell me why.
+`;
+}
+
+function buildClusterDiscussSeed(repo: EdwardRepo, parent: ClusterParent, children: EdwardTask[], concern?: string): string {
+  const childDetails = children.map((c, i) => {
+    const evidence = Object.keys(c.evidence || {}).length > 0
+      ? JSON.stringify(c.evidence, null, 2)
+      : '(none collected)';
+    return `### Child ${i + 1}: ${c.title}
+- Type: ${c.type}, Risk: ${c.risk_level}, Confidence: ${c.confidence}
+- Description: ${c.description || '(none)'}
+- Evidence: ${evidence}`;
+  }).join('\n\n');
+
+  const concernText = (concern && concern.trim().length > 0)
+    ? concern.trim()
+    : '(The user did not provide a specific concern when opening this chat. Before discussing anything else, ask them what part of this cluster they want to interrogate.)';
+
+  return `Hi — I'm looking at a cluster of ${children.length} related findings that Edward (a local repo-maintenance agent) grouped together while scanning one of my repositories. I want to reason through whether the grouping makes sense and what the real impact is.
+
+## Repository
+- ${repo.full_name}
+- Default branch: ${repo.default_branch}
+- Primary language: ${repo.language}
+
+## Cluster parent
+**${parent.title}**
+- Risk level: ${parent.risk_level}
+- Confidence: ${parent.confidence}
+
+### Parent narrative
+${parent.description}
+
+## Children (${children.length} findings)
+
+${childDetails}
+
+---
+
+## My specific concern
+
+${concernText}
+
+---
+
+Please engage with my concern above directly. Start by restating it in
+your own words so I know you got it, then help me evaluate:
+
+- Does the grouping make sense? Are these findings truly related?
+- What's the combined real-world impact when you consider all children together?
+- Are any children miscategorized — should they be standalone or in a different group?
 
 Be direct. If you think I'm wrong, say so and tell me why.
 `;
@@ -1819,6 +2084,7 @@ async function handleRequest(req: Request): Promise<Response> {
       // Slice raised from 10 to 30 to match the expanded SAVE_CAP and
       // expose long-tail findings in the primary "Suggestions" view.
       .slice(0, 30);
+    const cluster = clusterResults.get(suggestMatch[1]);
     return json({
       suggestions: repoTasks.map(task => ({
         task,
@@ -1828,6 +2094,8 @@ async function handleRequest(req: Request): Promise<Response> {
           snoozeUrl: `/api/v1/tasks/${task.id}/action`,
         },
       })),
+      cluster_parents: cluster?.parents ?? [],
+      clustering_failed: cluster?.clustering_failed ?? false,
     });
   }
 
@@ -2087,6 +2355,59 @@ async function handleRequest(req: Request): Promise<Response> {
           if (saved >= SAVE_CAP) break;
         }
 
+        // Remap cluster member_ids from pre-save IDs → actual stored IDs
+        if (result.raw_cluster && !result.clustering_failed) {
+          const preSaveById = new Map(result.tasks.map(t => [t.id, t]));
+          const findStored = (preSaveId: string): string | null => {
+            const orig = preSaveById.get(preSaveId);
+            if (!orig) return null;
+            const stored = [...tasks.values()].find(
+              t => t.repo_id === repo.id && t.type === orig.type && t.title === orig.title
+                   && !['dismissed', 'merged', 'failed'].includes(t.status)
+            );
+            return stored?.id ?? null;
+          };
+
+          const parents: ClusterParent[] = [];
+          for (const c of result.raw_cluster.clusters) {
+            const mappedIds = c.member_ids.map(findStored).filter((id): id is string => !!id);
+            if (mappedIds.length < 2) continue;
+            const children = mappedIds.map(id => tasks.get(id)!);
+            parents.push({
+              id: uuid(),
+              title: c.title,
+              description: c.description,
+              member_ids: mappedIds,
+              rationale: c.rationale,
+              confidence: Math.min(...children.map(ch => ch.confidence)),
+              risk_level: maxRisk(children.map(ch => ch.risk_level)),
+            });
+          }
+          const claimedIds = new Set(parents.flatMap(p => p.member_ids));
+          const isolateIds = result.raw_cluster.isolates
+            .map(findStored)
+            .filter((id): id is string => !!id && !claimedIds.has(id));
+          const allMentioned = new Set([...claimedIds, ...isolateIds]);
+          const unmentioned = [...tasks.values()]
+            .filter(t => t.repo_id === repo.id && t.status === 'suggested' && !allMentioned.has(t.id))
+            .map(t => t.id);
+
+          clusterResults.set(repo.id, {
+            parents,
+            isolate_ids: [...isolateIds, ...unmentioned],
+            clustering_failed: false,
+            created_at: new Date().toISOString(),
+          });
+          console.log(`[edward] clustering: ${parents.length} parents, ${isolateIds.length + unmentioned.length} isolates for ${repo.full_name}`);
+        } else if (result.clustering_failed) {
+          clusterResults.set(repo.id, {
+            parents: [],
+            isolate_ids: [],
+            clustering_failed: true,
+            created_at: new Date().toISOString(),
+          });
+        }
+
         // Stash open_questions from this scan. Dedupe against EVERY
         // prior question on the same repo (both status='open' and
         // status='answered') by question text — once the owner has
@@ -2182,6 +2503,76 @@ async function handleRequest(req: Request): Promise<Response> {
       console.warn(`[edward] recordAnswer failed for ${repo.full_name}: ${err?.message || err}`);
     }
     return json({ status: 'answered', question: q });
+  }
+
+  // Cluster parent action (dismiss cascade / discuss)
+  const clusterActionMatch = path.match(/^\/api\/v1\/repos\/([^/]+)\/cluster\/([^/]+)\/action$/);
+  if (clusterActionMatch && method === 'POST') {
+    const [, repoId, parentId] = clusterActionMatch;
+    const cluster = clusterResults.get(repoId);
+    if (!cluster) return json({ error: 'No cluster results for this repo' }, 404);
+    const parent = cluster.parents.find(p => p.id === parentId);
+    if (!parent) return json({ error: 'Cluster parent not found' }, 404);
+    const repo = repos.get(repoId);
+    if (!repo) return json({ error: 'Repo not found' }, 404);
+
+    const body = await req.json().catch(() => ({})) as { action?: string; reason?: string; concern?: string };
+    const action = body.action;
+
+    if (action === 'dismiss') {
+      const reason = body.reason || 'Dismissed via cluster parent';
+      let cascaded = 0;
+      for (const childId of parent.member_ids) {
+        const child = tasks.get(childId);
+        if (!child || child.status !== 'suggested') continue;
+        child.status = 'dismissed';
+        child.dismiss_reason = reason;
+        child.updated_at = new Date().toISOString();
+        try {
+          recordDismissal(repo.full_name, { type: child.type, title: child.title, id: child.id }, reason);
+        } catch (err: any) {
+          console.warn(`[edward] cascade dismiss: recordDismissal failed for ${childId}: ${err?.message}`);
+        }
+        cascaded++;
+      }
+      cluster.parents = cluster.parents.filter(p => p.id !== parentId);
+      return json({ status: 'dismissed', cascaded });
+    }
+
+    if (action === 'discuss') {
+      const children = parent.member_ids.map(id => tasks.get(id)).filter((c): c is EdwardTask => !!c);
+      const seed = buildClusterDiscussSeed(repo, parent, children, body.concern);
+      const chatDir = join(CHAT_DIR_ROOT, parent.id);
+      const seedPath = join(chatDir, 'seed.md');
+      const launchPath = join(chatDir, 'launch.sh');
+      try {
+        mkdirSync(chatDir, { recursive: true });
+        writeFileSync(seedPath, seed, 'utf-8');
+        const launchScript = `#!/bin/bash\ncd "$(dirname "$0")"\nexec "${CLAUDE_BIN}" "$(cat seed.md)"\n`;
+        writeFileSync(launchPath, launchScript, 'utf-8');
+        chmodSync(launchPath, 0o755);
+      } catch (err: any) {
+        return json({ error: `Failed to write chat files: ${err.message}` }, 500);
+      }
+      const command = `bash ${launchPath}`;
+      const forceClipboard = process.env.EDWARD_FORCE_CLIPBOARD_DISCUSS === '1';
+      const isDarwin = process.platform === 'darwin';
+      const result: DiscussResult = { mode: 'clipboard', launchPath, seedPath, command };
+      if (isDarwin && !forceClipboard) {
+        try {
+          const doScript = `tell application "Terminal" to do script "bash ${launchPath}"`;
+          const activate = 'tell application "Terminal" to activate';
+          const proc = spawn('osascript', ['-e', doScript, '-e', activate], { detached: true, stdio: 'ignore' });
+          proc.unref();
+          result.mode = 'terminal';
+        } catch (err: any) {
+          result.note = `osascript failed (${err.message}); returning clipboard fallback`;
+        }
+      }
+      return json(result);
+    }
+
+    return json({ error: `Unknown action: ${action}. Cluster parents support 'dismiss' and 'discuss' only.` }, 400);
   }
 
   // Task action
