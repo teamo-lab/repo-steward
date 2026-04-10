@@ -32,11 +32,16 @@ function runGh(args: string[]): string {
 
 /**
  * Post (or replace) Edward's review comment on a PR.
+ * If reviewMarkdown is provided it is appended to form a single combined
+ * comment (Edward invariant review + Qodo Merge code review).
  * Returns the comment URL, or null on failure.
  */
-export async function postReviewComment(result: ReviewResult): Promise<string | null> {
+export async function postReviewComment(
+  result: ReviewResult,
+  reviewMarkdown?: string
+): Promise<string | null> {
   const { owner, repo, number } = result.pr;
-  const body = renderCommentBody(result);
+  const body = renderCommentBody(result, reviewMarkdown);
 
   // 1. Find any existing edward:review:v1 comment on this PR and
   //    delete it, so we never stack duplicates.
@@ -83,7 +88,7 @@ export async function postReviewComment(result: ReviewResult): Promise<string | 
 
 // ── Body rendering ──
 
-export function renderCommentBody(result: ReviewResult): string {
+export function renderCommentBody(result: ReviewResult, reviewMarkdown?: string): string {
   const lines: string[] = [];
   lines.push(EDWARD_COMMENT_MARKER);
   lines.push('## 🦆 Edward — Business Invariant Review');
@@ -153,6 +158,14 @@ export function renderCommentBody(result: ReviewResult): string {
   }
 
   lines.push(appendixMetadata(result));
+
+  if (reviewMarkdown) {
+    lines.push('');
+    lines.push('---');
+    lines.push('');
+    lines.push(reviewMarkdown.trim());
+  }
+
   return lines.join('\n');
 }
 

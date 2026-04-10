@@ -498,6 +498,28 @@ async function promptAuthMode(
 }
 
 /**
+ * Silently pick the best available auth mode (OAuth preferred) without
+ * showing the interactive server-preflight menu. Used by subcommands
+ * that run standalone (e.g. `edward review`) so they honour OAuth when
+ * available and never silently bill to the Console API key.
+ */
+function silentAuth(): boolean {
+  const paths = detectAuthPaths();
+  const options = buildAuthOptions(paths);
+  const pick = options.find((o) => o.usable);
+  if (!pick) {
+    console.error(
+      `${c.red}error:${c.reset} no usable LLM auth configured.\n` +
+      `  Run ${c.bold}claude login${c.reset} (OAuth) or set ANTHROPIC_API_KEY.`
+    );
+    return false;
+  }
+  applyAuthMode(pick.id);
+  console.error(`${c.dim}[edward] Auth: ${pick.label}${c.reset}`);
+  return true;
+}
+
+/**
  * Map the chosen AuthMode to env vars the server picks up:
  *   - EDWARD_PROVIDER: 'claude' or 'codex'
  *   - EDWARD_AUTH_MODE: 'oauth' or 'api_key'  (claude only; codex
@@ -1250,6 +1272,11 @@ async function cmdReview(args: ParsedArgs): Promise<void> {
     );
   }
 
+  // Silently select best auth (OAuth preferred) without showing the
+  // interactive server-preflight menu. Prevents default billing to
+  // ANTHROPIC_API_KEY when OAuth is available.
+  if (!silentAuth()) process.exit(1);
+
   const { loadPRDiff, parsePRReference } = await import('./pr_diff.js');
   const { runPRReview, loadCachedContextForPRReview } = await import('./pr_review.js');
   const { postReviewComment, renderCommentBody } = await import('./pr_comment.js');
@@ -1364,9 +1391,12 @@ async function cmdReview(args: ParsedArgs): Promise<void> {
   const totalCost = result.diagnostics.stage_a_cost_usd + result.diagnostics.stage_b_cost_usd;
   console.log(`${d}Cost: $${totalCost.toFixed(3)}  Duration: ${totalDur.toFixed(1)}s${r}`);
 
+  const reviewMarkdown = codeReviewResult?.reviewMarkdown;
+
   if (codeReviewResult) {
     if (codeReviewResult.ok) {
-      console.log(`${c.green}✓ Qodo Merge code review posted${r}`);
+      const merged = reviewMarkdown ? 'merged into combined comment' : 'no comment found to merge';
+      console.log(`${c.green}✓ Qodo Merge code review complete${r} ${d}(${merged})${r}`);
     } else if (codeReviewResult.skipped) {
       console.log(`${d}Qodo Merge: skipped — ${codeReviewResult.skip_reason}${r}`);
     } else {
@@ -1381,11 +1411,11 @@ async function cmdReview(args: ParsedArgs): Promise<void> {
   if (args.dryRun) {
     console.log(`${d}--dry-run: skipping comment post. Rendered preview:${r}`);
     console.log('---8<---');
-    console.log(renderCommentBody(result));
+    console.log(renderCommentBody(result, reviewMarkdown));
     console.log('---8<---');
   } else {
     console.error(`${d}[edward] Posting review comment...${r}`);
-    const url = await postReviewComment(result);
+    const url = await postReviewComment(result, reviewMarkdown);
     if (url) {
       console.log(`${c.green}✓ Posted:${r} ${url}`);
     } else {
