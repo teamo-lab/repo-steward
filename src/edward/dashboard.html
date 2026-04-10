@@ -81,6 +81,22 @@
   .badge.dismissed, .badge.failed { background: rgba(248,81,73,0.15); color: var(--red); }
   .badge.snoozed { background: rgba(139,148,158,0.15); color: var(--text-muted); }
 
+  /* Cluster parent cards */
+  .cluster-parent { border-left: 3px solid var(--accent); }
+  .cluster-parent .chevron { display: inline-block; width: 14px; color: var(--text-muted); }
+  .cluster-children { margin-top: 12px; padding-left: 16px; border-left: 2px solid var(--border); }
+  .cluster-banner {
+    background: rgba(210, 153, 34, 0.1);
+    border: 1px solid var(--yellow);
+    color: var(--yellow);
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 14px;
+    font-size: 13px;
+  }
+  .badge.cluster { background: var(--accent); color: #fff; }
+  .badge.member-count { background: var(--surface); color: var(--text-muted); border: 1px solid var(--border); }
+
   .task-meta { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
   .task-meta .tag { font-size: 12px; color: var(--text-muted); }
   .task-meta .tag strong { color: var(--text); }
@@ -588,14 +604,45 @@ async function loadSuggestions() {
   if (!currentRepo) return;
   const data = await api('/api/v1/repos/' + currentRepo + '/suggestions');
   const el = document.getElementById('suggestions-list');
-  document.getElementById('suggestion-count').textContent = data.suggestions.length;
+  const suggestions = (data.suggestions || []);
+  const parents = (data.cluster_parents || []);
+  const degraded = data.clustering_failed === true;
 
-  if (data.suggestions.length === 0) {
+  // child lookup by task ID
+  const childById = {};
+  for (const s of suggestions) childById[s.task.id] = s;
+
+  // which children belong to a cluster
+  const clusteredIds = new Set();
+  for (const p of parents) {
+    for (const mid of (p.member_ids || [])) clusteredIds.add(mid);
+  }
+
+  // isolates = suggested tasks not claimed by any parent
+  const isolates = suggestions.filter(s => !clusteredIds.has(s.task.id));
+
+  // sort parents: highest risk first, tiebreak on member count
+  const riskOrder = { high: 3, medium: 2, low: 1 };
+  parents.sort((a, b) => (riskOrder[b.risk_level] || 0) - (riskOrder[a.risk_level] || 0)
+    || (b.member_ids?.length || 0) - (a.member_ids?.length || 0));
+
+  // skip parents whose live children are all gone
+  const liveParents = parents.filter(p =>
+    (p.member_ids || []).some(id => childById[id])
+  );
+
+  const topCount = liveParents.length + isolates.length;
+  document.getElementById('suggestion-count').textContent = topCount;
+
+  if (topCount === 0 && !degraded) {
     el.innerHTML = '<div class="empty"><div class="icon">&#10003;</div>No pending suggestions</div>';
     return;
   }
 
-  el.innerHTML = data.suggestions.map(s => renderTask(s.task, true)).join('');
+  el.innerHTML =
+    (degraded ? renderClusteringBanner() : '') +
+    liveParents.map(p => renderClusterParent(p, (p.member_ids || []).map(id => childById[id]).filter(Boolean))).join('') +
+    isolates.map(s => renderTask(s.task, true)).join('');
 }
 
 // ── Open Questions ──
@@ -678,6 +725,59 @@ async function loadTasks() {
   }
 
   el.innerHTML = data.tasks.map(t => renderTask(t, false)).join('');
+}
+
+function renderClusterParent(parent, childSuggestions) {
+  return `
+    <div class="task-card cluster-parent collapsed" data-cluster-id="${esc(parent.id)}" data-repo-id="${currentRepo}">
+      <div class="task-header" onclick="toggleCluster('${esc(parent.id)}')" style="cursor:pointer;">
+        <div class="task-title">
+          <span class="chevron">&#9656;</span>
+          ${esc(parent.title)}
+        </div>
+        <div style="display:flex; gap:6px; flex-shrink:0;">
+          <span class="badge cluster">cluster</span>
+          <span class="badge ${parent.risk_level}">${parent.risk_level} risk</span>
+          <span class="badge member-count">${childSuggestions.length} findings</span>
+        </div>
+      </div>
+      <div class="task-desc">${esc(parent.description)}</div>
+      <div class="actions" onclick="event.stopPropagation();">
+        <button class="btn btn-discuss" onclick="clusterAction('${currentRepo}', '${esc(parent.id)}', 'discuss')">Discuss cluster</button>
+        <button class="btn btn-dismiss" onclick="clusterAction('${currentRepo}', '${esc(parent.id)}', 'dismiss')">Dismiss cluster</button>
+      </div>
+      <div class="cluster-children" style="display:none;">
+        ${childSuggestions.map(s => renderTask(s.task, true)).join('')}
+      </div>
+    </div>
+  `;
+}
+
+function toggleCluster(id) {
+  const card = document.querySelector('[data-cluster-id="' + id + '"]');
+  if (!card) return;
+  const collapsed = card.classList.toggle('collapsed');
+  const children = card.querySelector('.cluster-children');
+  const chevron = card.querySelector('.chevron');
+  if (children) children.style.display = collapsed ? 'none' : 'block';
+  if (chevron) chevron.innerHTML = collapsed ? '&#9656;' : '&#9662;';
+}
+
+function renderClusteringBanner() {
+  return '<div class="cluster-banner">&#9888;&#65039; Clustering unavailable for this scan — showing flat list. Re-run discovery to try again.</div>';
+}
+
+async function clusterAction(repoId, parentId, action) {
+  const res = await fetch('/api/v1/repos/' + repoId + '/cluster/' + parentId + '/action', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action }),
+  });
+  const data = await res.json();
+  if (action === 'dismiss' && data.cascaded != null) {
+    toast('Cluster dismissed — ' + data.cascaded + ' findings suppressed');
+  }
+  loadSuggestions();
 }
 
 function renderTask(task, showActions) {
