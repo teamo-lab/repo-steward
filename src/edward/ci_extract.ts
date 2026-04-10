@@ -15,6 +15,7 @@
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { computeCICoverage, type CICoverageResult } from './ci_coverage.js';
 
 export type CIProvider =
   | 'github_actions'
@@ -46,6 +47,20 @@ export interface CIRawConfig {
     sizeBytes: number;
     truncated: boolean;
   }>;
+
+  /**
+   * Deterministic line-level coverage analysis. Computed by walking
+   * the source tree, extracting path prefixes from verifying CI
+   * steps (test / lint / typecheck / security-scan / grep invariants /
+   * script execution), and summing LOC over files that match at least
+   * one prefix.
+   *
+   * This is NOT traditional runtime test-line-rate. It's the static
+   * reachability question "which source code is in scope of any CI
+   * verification step", weighted by file LOC. Implementation in
+   * ci_coverage.ts.
+   */
+  coverage: CICoverageResult;
 }
 
 const MAX_FILE_BYTES = 100_000;
@@ -125,6 +140,7 @@ export function extractCIRawConfig(repoDir: string): CIRawConfig {
     if (primary === 'none') primary = provider;
   }
 
-  return { provider: primary, configFiles };
+  const coverage = computeCICoverage(repoDir, configFiles);
+  return { provider: primary, configFiles, coverage };
 }
 

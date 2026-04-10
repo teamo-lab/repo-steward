@@ -53,6 +53,19 @@ export interface LLMProviderConfig {
   maxBudgetUsd?: number;
   /** Spawn-level wall-clock timeout in milliseconds. Applied to both providers. */
   timeoutMs?: number;
+  /**
+   * If true, disable all agent tools on the claude side (passes
+   * `--tools ""`). Use for pure generation / reasoning tasks that
+   * don't need to explore the target repo. Codex doesn't have an
+   * equivalent knob and is unaffected.
+   *
+   * Without this, claude defaults to full tool access (Read / Bash /
+   * Grep / etc) and may spend its turn budget exploring the cwd
+   * instead of producing output. On large repos this manifests as
+   * `claude hangs for the entire timeout and returns empty stdout`,
+   * a bug observed on ama-user-service with ~20KB Phase-B prompts.
+   */
+  noTools?: boolean;
 }
 
 export interface LLMCallResult {
@@ -108,6 +121,13 @@ export function isRetriableLLMError(err: string | undefined): boolean {
     'non-json output',
     'claude exited', 'codex exited',
     'sigterm', 'killed',
+    // Claude CLI envelope errors — these are usually transient
+    // Anthropic API failures (overload, rate limit, max-turns hit
+    // with empty output) surfacing through the CLI's JSON error
+    // envelope. Phase B was losing 4/6 batches because this class
+    // of error wasn't being retried or handed off to the fallback
+    // provider.
+    'is_error', 'no result text',
   ];
   return retriable.some(m => s.includes(m));
 }
@@ -482,6 +502,17 @@ async function spawnClaude(
   delete env.CLAUDECODE;
   delete env.CLAUDE_CODE_ENTRYPOINT;
 
+  // Honor the startup auth-mode selection. When the user picked
+  // "Claude OAuth" at `edward serve` start, cli.ts sets
+  // EDWARD_AUTH_MODE=oauth. We strip ANTHROPIC_API_KEY from the
+  // CHILD env so the claude CLI falls back to OAuth credentials
+  // (Keychain on macOS, ~/.claude/.credentials.json elsewhere).
+  // The parent shell's env is untouched — we only modify this
+  // copy before passing it to spawn().
+  if (process.env.EDWARD_AUTH_MODE === 'oauth') {
+    delete env.ANTHROPIC_API_KEY;
+  }
+
   const args = [
     '-p', prompt,
     '--output-format', 'json',
@@ -491,6 +522,17 @@ async function spawnClaude(
     '--max-turns', String(cfg.maxTurns ?? 40),
     '--max-budget-usd', String(cfg.maxBudgetUsd ?? 5),
   ];
+  // Pure text-generation callers (business context extract, functional
+  // CI gap analysis + test synthesis) pass noTools=true to disable the
+  // full agent tool stack. Without this, claude spends its turn budget
+  // exploring the cwd with Read/Bash/Grep instead of producing output,
+  // and on large repos ends up hanging until the spawn timeout kills
+  // it with zero bytes on stdout. Verified on ama-user-service: a
+  // ~20KB Phase B prompt went from 420s timeout (hang) to 7.7s with
+  // `--tools ""`.
+  if (cfg.noTools) {
+    args.push('--tools', '');
+  }
 
   const stdout = await new Promise<string>((resolve, reject) => {
     const proc = spawn(binPath, args, {
@@ -527,6 +569,18 @@ async function spawnClaude(
 
   const costUsd = typeof parsed?.total_cost_usd === 'number' ? parsed.total_cost_usd : 0;
   if (parsed?.is_error || !parsed?.result) {
+    // Build a richer error string so fallback + future debugging
+    // can see WHY claude bailed. The CLI's error envelope often
+    // carries `error.type` / `subtype` / `duration_api_ms` that
+    // identify the real cause (overload/rate-limit/max-turns).
+    const envelopeHints: string[] = [];
+    if (parsed?.error?.type) envelopeHints.push(`type=${parsed.error.type}`);
+    if (parsed?.error?.subtype) envelopeHints.push(`subtype=${parsed.error.subtype}`);
+    if (parsed?.error?.message) envelopeHints.push(`msg=${String(parsed.error.message).slice(0, 160)}`);
+    if (parsed?.subtype) envelopeHints.push(`envelope_subtype=${parsed.subtype}`);
+    if (typeof parsed?.num_turns === 'number') envelopeHints.push(`turns=${parsed.num_turns}`);
+    if (typeof parsed?.duration_api_ms === 'number') envelopeHints.push(`api_ms=${parsed.duration_api_ms}`);
+    const hintStr = envelopeHints.length > 0 ? ` [${envelopeHints.join(' ')}]` : '';
     return {
       ok: false,
       stdout: '',
@@ -534,8 +588,8 @@ async function spawnClaude(
       durationMs: duration,
       attempts: 1,
       error: typeof parsed?.result === 'string'
-        ? parsed.result.slice(0, 500)
-        : 'claude returned is_error=true with no result text',
+        ? parsed.result.slice(0, 500) + hintStr
+        : `claude returned is_error=true with no result text${hintStr}`,
     };
   }
 
